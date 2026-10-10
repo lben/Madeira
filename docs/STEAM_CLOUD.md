@@ -46,7 +46,9 @@ turns this off):
 - A check or transfer is running: an alert offers **Wait and sync** (the game
   starts when it finishes) or **Launch anyway**.
 - The check failed (no network, for example): **Try again** or **Launch
-  anyway**.
+  anyway**. When the sync before the start fails, it is tried once more 3 s
+  later before the alert: a game started by a link right as Madeira opens
+  can meet Madeira's Steam connection still coming up.
 - Saves wait for a choice: **Choose** opens the game's page, or **Launch
   anyway**.
 

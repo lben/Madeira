@@ -775,7 +775,17 @@ final class SteamOwnedLibrary: ObservableObject {
         for _ in 0..<600 where cloudBusy.contains(appID) { try? await Task.sleep(nanoseconds: 200_000_000) }
         cloud[appID]?.problem = nil      // a transfer that stops again says so again
         await syncCloud(appID)
-        let hold = cloudHold(appID)
+        var hold = cloudHold(appID)
+        // Started by a link at a cold start (a Home Screen shortcut, the Madeira Reopen
+        // relaunch), the check can meet the app's own Steam connection still coming up
+        // and fail at once; one more try before asking.
+        if case .unchecked = hold {
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            for _ in 0..<600 where cloudBusy.contains(appID) { try? await Task.sleep(nanoseconds: 200_000_000) }
+            cloud[appID]?.problem = nil
+            await syncCloud(appID)
+            hold = cloudHold(appID)
+        }
         SteamLog.event("[steam-cloud] app=\(appID) before-play sync result=\(hold.map { "\($0)" } ?? "clear")")
         return hold == .stale ? nil : hold
     }
