@@ -3,7 +3,7 @@
 # Builds every native input the app links from the pinned submodules (docs/BUILDING.md),
 # then the app itself, and uploads Madeira-sideload.ipa as a workflow artifact.
 # The Windows-side DLL farms (aarch64-windows, arm64ec-windows) are tracked and used as is;
-# the optional 32-bit WoW64 farm (build/wine-i386) is not built.
+# the optional 32-bit WoW64 farm (build/wine-i386) is built when it can be (a warning otherwise).
 #
 # Microsoft's VC++ runtime DLLs are not part of this repository (tools/fetch-vcruntime.md).
 # Manual runs download them from Microsoft into the bundle unless the "vcruntime" input is off;
@@ -258,6 +258,9 @@ jobs:
             build/dxmt-ios/libdxmt_unix.a toolchains/llvm-ios-build/lib/libLLVM*.a 2>&1 | grep -v "same member name" || true
           cp build/dxmt-ios/libdxmt_combined.a app/Madeira/libdxmt_combined.a
           ls -lh app/Madeira/*.a
+
+      - name: 32-bit WoW64 farm (i386 Wine modules + DXMT)
+        run: build/wine-i386/build.sh || echo "::warning::i386 farm build failed; this IPA runs no 32-bit programs"
 
       - name: Madeira Dock (x86-64 PE)
         run: build/madeira-dock/build.sh || echo "::warning::Madeira Dock build failed; the Dock stays hidden"
