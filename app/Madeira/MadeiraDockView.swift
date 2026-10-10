@@ -78,7 +78,7 @@ final class MadeiraDockModel: ObservableObject {
         status = plan.map { $0 + "\n" + starting } ?? starting
         if let plan { LogStore.shared.log("[dock-installers] " + plan) }
         watch = Task { @MainActor in
-            var idle = 0, started = false
+            var idle = 0, started = false, finishedNormally = false
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 let report = MadeiraDock.pollReport()
@@ -95,6 +95,7 @@ final class MadeiraDockModel: ObservableObject {
                     } else {
                         status = "Madeira Dock finished normally."
                         LogStore.shared.log("[madeira-dock] host finished (result 0)")
+                        finishedNormally = true
                     }
                     break
                 }
@@ -120,6 +121,18 @@ final class MadeiraDockModel: ObservableObject {
             // The host is done with the sign-in: the app's own Steam connection may come
             // back once no session runs (SteamOwnedLibrary).
             SteamOwnedLibrary.shared.dockEnded()
+            // The game closed, but the Dock's desktop session never ends by itself: with
+            // the Madeira Reopen shortcut on, a library session goes back to a fresh library.
+            // Not while something still draws (a launcher's game outliving it).
+            if finishedNormally, LibraryModel.relaunchEnabled, LibraryModel.shared.current != nil {
+                let frames = (madeira_get_present_count(), winios_surface_present_count())
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                if !Task.isCancelled, frames == (madeira_get_present_count(), winios_surface_present_count()), LibraryModel.shared.current != nil {
+                    LibraryModel.shared.restart(playing: nil)
+                } else {
+                    LogStore.shared.log("[session-once] the screen still changes after the host finished: no relaunch")
+                }
+            }
         }
     }
 }

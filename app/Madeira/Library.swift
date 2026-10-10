@@ -953,6 +953,39 @@ final class LibraryModel: ObservableObject {
     static var sessionsThisRun = 0
     static let restartMessage = "Restart Madeira to start another game: swipe Madeira away in the app switcher, then open it again."
     @Published var restartNotice: String?
+    /// The Shortcuts shortcut that reopens Madeira: Wait 2 seconds, then Open URLs
+    /// with the Shortcut Input. iOS lets no app start itself again.
+    static let relaunchShortcut = "Madeira Reopen"
+    /// Restart Madeira by itself through the Madeira Reopen shortcut instead of asking
+    /// the user to. Off unless it is 1.
+    static var relaunchEnabled: Bool { MadeiraConfig.flag("MADEIRA_RELAUNCH_SHORTCUT", fallback: false) }
+
+    /// The restart a second session needs: with relaunchEnabled, runs the Madeira
+    /// Reopen shortcut with `entry`'s madeira://play link (ShortcutRouter starts it once
+    /// the library is up) and quits; nil, or the Desktop entry, which has no link, only
+    /// reopens the library. Otherwise, or when Shortcuts does not open, the restart notice.
+    @MainActor func restart(playing entry: LibraryEntry?) {
+        guard Self.relaunchEnabled else { restartNotice = Self.restartMessage; return }
+        let link = entry.flatMap { $0.desktop == true ? nil : ShortcutRouter.link(for: $0.windowsPath) } ?? "madeira://library"
+        var c = URLComponents()
+        c.scheme = "shortcuts"
+        c.host = "run-shortcut"
+        c.queryItems = [URLQueryItem(name: "name", value: Self.relaunchShortcut),
+                        URLQueryItem(name: "input", value: "text"),
+                        URLQueryItem(name: "text", value: link)]
+        // URLComponents leaves "+" as is, which a query decoder may read as a space.
+        c.percentEncodedQuery = c.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
+        guard let url = c.url else { restartNotice = Self.restartMessage; return }
+        LogStore.shared.log("[session-once] relaunching through the \(Self.relaunchShortcut) shortcut (game=\(link.hasPrefix("madeira://play") ? 1 : 0))")
+        UIApplication.shared.open(url) { opened in
+            guard opened else {
+                LogStore.shared.log("[session-once] Shortcuts could not be opened", level: .error)
+                MainActor.assumeIsolated { LibraryModel.shared.restartNotice = Self.restartMessage }
+                return
+            }
+            exit(0)
+        }
+    }
     /// CS_DEBUGGED is set but no debugger is attached (JIT was enabled outside
     /// Madeira): the text of the alert that offers Madeira's own Enable JIT.
     @Published var jitNotice: String?

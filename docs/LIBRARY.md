@@ -291,6 +291,16 @@ process (the wineserver's permanent objects from the first session remain and
 the registry initialisation aborts). The library asks to restart Madeira
 instead.
 
+With `env.MADEIRA_RELAUNCH_SHORTCUT = 1` Madeira restarts by itself, through a
+Shortcuts shortcut named **Madeira Reopen** (iOS lets no app start itself
+again). The shortcut has two actions: Wait 2 seconds, then Open URLs with the
+Shortcut Input. Madeira runs it and quits. A second Play passes the game's
+`madeira://play` link, the same one as its Home Screen shortcut, so the game
+starts once the library is up. When a Madeira Dock game closes normally and
+nothing draws for 3 s, the Dock's desktop session (which does not end by
+itself) is left the same way, and the shortcut opens a fresh library. If
+Shortcuts does not open, the restart notice shows as before.
+
 ## First-run setup
 
 The code is `app/Madeira/Onboarding.swift`. It uses `JITCoordinator` for the

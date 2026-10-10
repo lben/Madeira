@@ -2528,7 +2528,7 @@ struct ContentView: View {
         // One Wine session per app run (see LibraryModel.sessionsThisRun).
         if LibraryModel.sessionsThisRun > 0, MadeiraConfig.flag("MADEIRA_ONE_SESSION_PER_RUN") {
             LogStore.shared.log("[session-once] launch held: \(LibraryModel.sessionsThisRun) session(s) already ran in this app run")
-            library.restartNotice = LibraryModel.restartMessage; return
+            library.restart(playing: entry); return
         }
         // The same precondition runWineFullSequence checks: the JIT pool is
         // taken at launch, through the debugger. Without it, Play enables JIT and
@@ -3267,7 +3267,7 @@ struct ContentView: View {
         }
         if inLibrary, LibraryModel.sessionsThisRun > 0, MadeiraConfig.flag("MADEIRA_ONE_SESSION_PER_RUN") {
             LogStore.shared.log("[session-once] Dock launch held: \(LibraryModel.sessionsThisRun) session(s) already ran in this app run")
-            library.restartNotice = LibraryModel.restartMessage
+            library.restart(playing: profile)
             return
         }
         func fail(_ error: Error) {
