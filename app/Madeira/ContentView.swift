@@ -243,7 +243,7 @@ final class MetalBackedView: UIView {
             MetalBackedView.refreshDisplayMode(reason: "mode-changed")
         },
         NotificationCenter.default.addObserver(forName: UIDevice.orientationDidChangeNotification, object: nil, queue: .main) { _ in
-            ScreenZoom.reset()   // its centre and limits are the old bounds'
+            ScreenZoom.boundsChanged()
             MetalBackedView.refreshDisplayMode(reason: "orientation")
         },
     ]
@@ -649,8 +649,10 @@ final class MetalBackedView: UIView {
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         if HardwareInput.shared.interceptTouches(touches, event, .began) { return }
-        guard let touches = tmgFilter(touches, .began) else { return }
+        let kept = tmgFilter(touches, .began)
+        // The zoom is not game input: it works where the touch-mouse gate keeps fingers from the game.
         if zoomTouchesChanged(event) { return }
+        guard let touches = kept else { return }
         if touchPointerMode { touchModeBegan(touches); return }
         guard desktopMode else {
             guard directTouch == nil, let t = touches.first else { return }
@@ -698,8 +700,9 @@ final class MetalBackedView: UIView {
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         if HardwareInput.shared.interceptTouches(touches, event, .moved) { return }
-        guard let touches = tmgFilter(touches, .moved) else { return }
+        let kept = tmgFilter(touches, .moved)
         if zoomMoved(event) { return }
+        guard let touches = kept else { return }
         if touchPointerMode { touchModeMoved(touches, event); return }
         guard desktopMode else {
             guard let t = directTouch, touches.contains(t) else { return }
@@ -781,8 +784,9 @@ final class MetalBackedView: UIView {
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         if HardwareInput.shared.interceptTouches(touches, event, .ended) { return }
-        guard let touches = tmgFilter(touches, .ended) else { return }
+        let kept = tmgFilter(touches, .ended)
         if zoomTouchesChanged(event) { return }
+        guard let touches = kept else { return }
         if touchPointerMode { touchModeEnded(touches, event); return }
         guard desktopMode else {
             guard let t = directTouch, touches.contains(t) else { return }
@@ -827,8 +831,9 @@ final class MetalBackedView: UIView {
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         if HardwareInput.shared.interceptTouches(touches, event, .cancelled) { return }
-        guard let touches = tmgFilter(touches, .cancelled) else { return }
+        let kept = tmgFilter(touches, .cancelled)
         if zoomTouchesChanged(event) { return }
+        guard let touches = kept else { return }
         if touchPointerMode { touchModeCancelled(touches); return }
         guard desktopMode else {
             guard let t = directTouch, touches.contains(t) else { return }
@@ -857,6 +862,8 @@ enum ScreenZoom {
     /// shown = scale * point + offset, in window points.
     private(set) static var offset = CGPoint.zero
     private static weak var window: UIWindow?
+    /// The window's size the zoom was set for: its centre and limits.
+    private static var size = CGSize.zero
     static var zoomed: Bool { scale > 1.001 }
 
     static func set(scale s: CGFloat, offset t: CGPoint, in w: UIWindow) {
@@ -866,7 +873,7 @@ enum ScreenZoom {
         offset = k > 1.001 ? CGPoint(x: min(max(t.x, size.width - k * size.width), 0),
                                      y: min(max(t.y, size.height - k * size.height), 0)) : .zero
         if k <= 1.001 { scale = 1 }
-        window = w
+        window = w; self.size = size
         // sublayerTransform scales around the layer's centre (checked with CALayer.convert).
         let c = CGPoint(x: w.bounds.midX, y: w.bounds.midY)
         let m = CGAffineTransform(a: scale, b: 0, c: 0, d: scale,
@@ -874,6 +881,10 @@ enum ScreenZoom {
         CATransaction.begin(); CATransaction.setDisableActions(true)
         w.layer.sublayerTransform = scale == 1 ? CATransform3DIdentity : CATransform3DMakeAffineTransform(m)
         CATransaction.commit()
+    }
+    /// A rotation: the zoom was set for the other shape.
+    static func boundsChanged() {
+        DispatchQueue.main.async { if let w = window, w.bounds.size != size { reset() } }   // after the bounds update
     }
     static func reset() {
         guard let w = window, zoomed else { return }
