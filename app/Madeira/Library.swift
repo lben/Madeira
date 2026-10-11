@@ -4582,9 +4582,10 @@ struct ScreenLayoutEditor: View {
     @State private var marking: CGRect?
     @State private var moveFrom: CGRect?
     @State private var attempt = 0
-    // The bar: where it is (dragged by its grip), and whether it is folded into a button.
-    @State private var bar = CGPoint(x: 0.5, y: 0.2)
-    @State private var barFrom: CGPoint?
+    // The bar: its top centre, from the screen's top centre (dragged by its grip; it grows
+    // downwards), and whether it is folded into a button.
+    @State private var bar = CGSize(width: 0, height: 8)
+    @State private var barFrom: CGSize?
     @State private var folded = false
     private enum Mode { case none, zone, anchor }
     private static let scales: ClosedRange<Double> = 0.5...6
@@ -4669,8 +4670,8 @@ struct ScreenLayoutEditor: View {
             }
         }
         .fixedSize()
-        .position(x: bar.x * size.width, y: bar.y * size.height)
-        .frame(width: size.width, height: size.height, alignment: .topLeading)
+        .offset(x: bar.width, y: bar.height)
+        .frame(width: size.width, height: size.height, alignment: .top)
     }
 
     /// The grip that moves the bar (global: the bar moves under the finger).
@@ -4679,8 +4680,8 @@ struct ScreenLayoutEditor: View {
             .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global).onChanged { g in
                 let from = barFrom ?? bar
                 barFrom = from
-                bar = CGPoint(x: min(max(from.x + g.translation.width / max(size.width, 1), 0.1), 0.9),
-                              y: min(max(from.y + g.translation.height / max(size.height, 1), 0.06), 0.94))
+                bar = CGSize(width: min(max(from.width + g.translation.width, -size.width / 2 + 60), size.width / 2 - 60),
+                             height: min(max(from.height + g.translation.height, 4), size.height - 60))
             }.onEnded { _ in barFrom = nil })
     }
 
