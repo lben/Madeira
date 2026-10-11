@@ -327,7 +327,8 @@ static NSString *const kRemapMSL = @
 "  float2 a = r.xy + (r.zw - r.xy) * float2(g.xy) / float2(48, 12);\n"
 "  float2 b = r.xy + (r.zw - r.xy) * float2(g.xy + 1) / float2(48, 12);\n"
 "  float s = 0; int n = 0;\n"
-"  for (int y = int(a.y); y < int(ceil(b.y)); y++) for (int x = int(a.x); x < int(ceil(b.x)); x++) {\n"
+"  int y1 = min(int(ceil(b.y)), int(t.get_height())), x1 = min(int(ceil(b.x)), int(t.get_width()));\n"   // as ScreenLayouts.signature
+"  for (int y = int(a.y); y < y1; y++) for (int x = int(a.x); x < x1; x++) {\n"
 "    s += dot(t.read(uint2(x, y)).rgb, float3(0.299, 0.587, 0.114)); n++; }\n"
 "  out[g.z * 576 + g.y * 48 + g.x] = s / max(n, 1);\n"
 "}\n";
@@ -344,7 +345,7 @@ typedef struct {
 static struct {
     pthread_mutex_t lock;
     _Atomic int busy;   // layouts set or a capture waiting: the hook does nothing without it
-    MadeiraRemapZone zones[MADEIRA_REMAP_MAX_ZONES];
+    MadeiraRemapZone zones[MADEIRA_REMAP_MAX_ZONES * MADEIRA_REMAP_MAX_LAYOUTS];   // 16 per layout
     int zoneCount;
     MadeiraRemapLayout layouts[MADEIRA_REMAP_MAX_LAYOUTS];
     int layoutCount, anchoredCount, fallback;   // fallback: the first layout without an anchor, or -1
@@ -383,7 +384,7 @@ void madeira_remap_set_layouts(int layoutCount, const int *zoneCounts, const flo
         for (int i = 0; i < zoneCounts[l]; i++, read++) {
             MadeiraRemapZone c;
             memcpy(&c, zones + read * 9, sizeof c);
-            if (z >= MADEIRA_REMAP_MAX_ZONES || !madeira_remap_rect_ok(c.sx0, c.sy0, c.sx1, c.sy1) ||
+            if (L->count >= MADEIRA_REMAP_MAX_ZONES || !madeira_remap_rect_ok(c.sx0, c.sy0, c.sx1, c.sy1) ||
                 !madeira_remap_rect_ok(c.dx0, c.dy0, c.dx1, c.dy1)) continue;
             g_remap.zones[z++] = c; L->count++;
         }
