@@ -243,6 +243,7 @@ final class MetalBackedView: UIView {
             MetalBackedView.refreshDisplayMode(reason: "mode-changed")
         },
         NotificationCenter.default.addObserver(forName: UIDevice.orientationDidChangeNotification, object: nil, queue: .main) { _ in
+            ScreenZoom.reset()   // its centre and limits are the old bounds'
             MetalBackedView.refreshDisplayMode(reason: "orientation")
         },
     ]
@@ -587,11 +588,17 @@ final class MetalBackedView: UIView {
     private var zoomStart: (distance: CGFloat, scale: CGFloat, content: CGPoint)?
     private var zooming = false
 
+    /// This view's own fingers. event.allTouches also holds the ones on the touch controls'
+    /// window (a held on-screen button), which are not the game's.
+    private func ownTouches(_ event: UIEvent?) -> [UITouch] {
+        (event?.touches(for: self) ?? []).filter { $0.phase != .ended && $0.phase != .cancelled }
+    }
+
     /// Two fingers moving apart or together zoom and pan the game view; true while a zoom
     /// gesture owns the touches (until every finger has lifted).
     private func zoomMoved(_ event: UIEvent?) -> Bool {
         guard LibraryModel.shared.current != nil, let w = window else { return false }
-        let active = activeTouches(event)
+        let active = ownTouches(event)
         guard active.count == 2 else { return zooming }
         // Raw window points: a touch's location in a view already has the zoom taken out.
         let a = active[0].location(in: nil), b = active[1].location(in: nil)
@@ -616,15 +623,16 @@ final class MetalBackedView: UIView {
         } else if desktopMode {
             if dragActive { postPointer(F_LUP); dragActive = false; dragTouch = nil }
             twoFingerMoved = true   // no right click
-        } else if let p = directTouchPoint {
-            let (x, y) = mapPoint(p); winios_post_touch_up(x, y)
+        } else if let d = directTouch {
+            let (x, y) = mapTouch(d); winios_post_touch_up(x, y)
+            directTouch = nil
         }
         fputs("[zoom] pinch began\n", stderr)
     }
 
     /// Touches ending or starting: a zoom ends when every finger has lifted.
     private func zoomTouchesChanged(_ event: UIEvent?) -> Bool {
-        let left = activeTouches(event).count
+        let left = ownTouches(event).count
         if left != 2 { zoomStart = nil }
         guard zooming else { return false }
         if left == 0 {
@@ -635,8 +643,9 @@ final class MetalBackedView: UIView {
         }
         return true
     }
-    /// Direct sessions (no pointer mode): where the first finger is, for a zoom to release it.
-    private var directTouchPoint: CGPoint?
+    /// Direct sessions (no pointer mode): the finger the game follows, the first one down,
+    /// until it lifts or a zoom takes the gesture.
+    private weak var directTouch: UITouch?
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         if HardwareInput.shared.interceptTouches(touches, event, .began) { return }
@@ -644,8 +653,8 @@ final class MetalBackedView: UIView {
         if zoomTouchesChanged(event) { return }
         if touchPointerMode { touchModeBegan(touches); return }
         guard desktopMode else {
-            guard let t = touches.first, directTouchPoint == nil else { return }
-            directTouchPoint = t.location(in: self)
+            guard directTouch == nil, let t = touches.first else { return }
+            directTouch = t
             let (x, y) = mapTouch(t)
             winios_post_touch_down(x, y)
             return
@@ -693,8 +702,7 @@ final class MetalBackedView: UIView {
         if zoomMoved(event) { return }
         if touchPointerMode { touchModeMoved(touches, event); return }
         guard desktopMode else {
-            guard let t = touches.first, directTouchPoint != nil else { return }
-            directTouchPoint = t.location(in: self)
+            guard let t = directTouch, touches.contains(t) else { return }
             let (x, y) = mapTouch(t)
             winios_post_touch_move(x, y)
             return
@@ -774,11 +782,11 @@ final class MetalBackedView: UIView {
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         if HardwareInput.shared.interceptTouches(touches, event, .ended) { return }
         guard let touches = tmgFilter(touches, .ended) else { return }
-        if zoomTouchesChanged(event) { if activeTouches(event).isEmpty { directTouchPoint = nil }; return }
+        if zoomTouchesChanged(event) { return }
         if touchPointerMode { touchModeEnded(touches, event); return }
         guard desktopMode else {
-            guard let t = touches.first, directTouchPoint != nil else { return }
-            if activeTouches(event).isEmpty { directTouchPoint = nil }
+            guard let t = directTouch, touches.contains(t) else { return }
+            directTouch = nil
             let (x, y) = mapTouch(t)
             winios_post_touch_up(x, y)
             return
@@ -820,11 +828,11 @@ final class MetalBackedView: UIView {
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         if HardwareInput.shared.interceptTouches(touches, event, .cancelled) { return }
         guard let touches = tmgFilter(touches, .cancelled) else { return }
-        if zoomTouchesChanged(event) { if activeTouches(event).isEmpty { directTouchPoint = nil }; return }
+        if zoomTouchesChanged(event) { return }
         if touchPointerMode { touchModeCancelled(touches); return }
         guard desktopMode else {
-            guard let t = touches.first, directTouchPoint != nil else { return }
-            if activeTouches(event).isEmpty { directTouchPoint = nil }
+            guard let t = directTouch, touches.contains(t) else { return }
+            directTouch = nil
             let (x, y) = mapTouch(t)
             winios_post_touch_up(x, y)
             return
