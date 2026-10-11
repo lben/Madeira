@@ -312,11 +312,19 @@ final class MetalBackedView: UIView {
             let w = convert(p, to: nil)
             var px: Int32 = 0, py: Int32 = 0
             _ = winios_desktop_point_from_window(Double(w.x), Double(w.y), &px, &py)
+            // A touch on a screen layout's copy goes to what it shows.
+            var fx = 0.0, fy = 0.0, fw = 0.0, fh = 0.0
+            if winios_game_client_rect(&fx, &fy, &fw, &fh) != 0 {
+                let q = ScreenLayouts.touch(CGPoint(x: CGFloat(px), y: CGFloat(py)), frame: CGRect(x: fx, y: fy, width: fw, height: fh))
+                px = Int32(q.x); py = Int32(q.y)
+            }
             Self.cursor = CGPoint(x: CGFloat(px), y: CGFloat(py))   // keep the trackpad cursor in step
             return (px, py)
         }
-        let g = GameSurfaceLayout.map(point: p, guest: guestSize(), aspect: drawableAspect(),
-                                      bounds: bounds, mode: effectiveDisplayMode())
+        let guest = guestSize()
+        let g = ScreenLayouts.touch(GameSurfaceLayout.map(point: p, guest: guest, aspect: drawableAspect(),
+                                                          bounds: bounds, mode: effectiveDisplayMode()),
+                                    frame: CGRect(origin: .zero, size: guest))
         return (Int32(g.x), Int32(g.y))
     }
 
@@ -3897,7 +3905,7 @@ final class ControlsWindow: UIWindow {
         // button, its performance overlay and the touch controls do.
         let library = LibraryModel.shared
         if library.current != nil {
-            if library.menu || library.launching || library.menuButtonRect.contains(point) ||
+            if library.menu || library.launching || library.layoutEditing || library.menuButtonRect.contains(point) ||
                 (library.performance && library.performanceRect.contains(point)) {
                 return super.hitTest(point, with: event)
             }

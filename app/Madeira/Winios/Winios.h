@@ -77,6 +77,8 @@ int winios_compositor_set_hidden(int hidden);
 void winios_note_game_metal_hwnd(void *hwnd);
 void winios_session_reset(void);
 int winios_desktop_point_from_window(double wx, double wy, int *px, int *py);
+/* Screen layouts: the desktop-pixel rect the game's frame covers (0: none). Main thread. */
+int winios_game_client_rect(double *x, double *y, double *w, double *h);
 
 /* Top-level window census, for the starting screen of a Madeira Dock start
  * (DockStartScreen.swift). A Dock start is a desktop session, and the

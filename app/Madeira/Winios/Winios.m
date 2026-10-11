@@ -975,6 +975,27 @@ int winios_desktop_point_from_window(double wx, double wy, int *px, int *py) {
     return 1;
 }
 
+/* Screen layouts (Library.swift): the rect, in the desktop pixels that
+ * winios_desktop_point_from_window returns, which the game's frame covers: the
+ * fitted window's client rect, else the largest presenting window's. 0: no DXMT
+ * window. Main thread only. */
+int winios_game_client_rect(double *x, double *y, double *w, double *h) {
+    CGRect best = CGRectNull;
+    if (g_fit_key) best = g_fit_client_px;
+    else for (NSNumber *key in g_metal_layers) {
+        NSValue *v = g_client_rects[key];
+        if (!v) continue;
+        CGRect c = v.CGRectValue;
+        if (CGRectIsNull(best) || c.size.width * c.size.height > best.size.width * best.size.height) best = c;
+    }
+    if (CGRectIsNull(best) || best.size.width < 1 || best.size.height < 1) return 0;
+    if (x) *x = best.origin.x;
+    if (y) *y = best.origin.y;
+    if (w) *w = best.size.width;
+    if (h) *h = best.size.height;
+    return 1;
+}
+
 /* GAME-MODE WINDOWS. A game's launcher or message box (Ghost of Tsushima's
  * Play / Options box, its "No installed graphics card" dialog) is a GDI
  * window; outside desktop mode nothing drew it, so the game sat waiting for a

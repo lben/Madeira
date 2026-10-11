@@ -301,6 +301,23 @@ nothing draws for 3 s, the Dock's desktop session (which does not end by
 itself) is left the same way, and the shortcut opens a fresh library. If
 Shortcuts does not open, the restart notice shows as before.
 
+## Screen layouts
+
+The in-game menu's **Screen layout** (games in the library) makes small text
+and HUD parts readable on a phone: the game's current frame is shown frozen,
+**Add zone** and a drag mark a part of it, and its copy, twice as large to begin
+with, can be moved and sized (0.5x to 4x) and can black out the original.
+**Save** stores the zones with the game (`screenZones` in the library file) and
+they apply at once and in its next sessions.
+
+The game is not changed: the zones are drawn as the last step on each frame
+(`madeira_present_remap` in `IOSDisplayShim.m`, called by the dxmt fork's
+winemetal before every present: D3D9/10/11 and D3D12), with a Lanczos-3
+filter, from the frame as the game drew it. A touch on a copy goes to the same
+spot of its source, in direct and Madeira Dock sessions (`mapPoint`,
+`winios_game_client_rect`). Games drawn without DXMT (GDI, OpenGL) get no
+layout. `env.MADEIRA_SCREEN_LAYOUTS = 0` hides the editor and draws no zones.
+
 ## First-run setup
 
 The code is `app/Madeira/Onboarding.swift`. It uses `JITCoordinator` for the

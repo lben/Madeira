@@ -279,27 +279,18 @@ void macdrv_view_release_metal_view(macdrv_metal_view v) {
 // encode thread, before it presents it. Work encoded here lands in the game's own
 // command buffer, after the frame and before the present.
 //
-// Milestone 0 (env.MADEIRA_REMAP_TEST): a fixed test layout proves the path on the
-// device. The top-left 30%x20% of the frame is drawn again, twice as large, in the
-// middle (Lanczos-3), and the top-right corner is reduced to a 48x12 edge
-// signature every 6th frame and compared with the first one. 1 = always on,
-// 2 = on and off in turns of 10 s so the cost shows in the log. Off by default.
+// A layout is a list of zones in the frame's normalised coordinates (0..1, origin
+// top-left): each copies its source rect to its destination rect (Lanczos-3), and
+// may black out the source. All sources are copied out first, so zones read the
+// frame as the game drew it. The front end sets the zones of the running game
+// (ScreenLayouts in Library.swift) and asks for one frame for its editor.
 
-static int madeira_remap_test_mode(void) {
-    static int mode = -1;
-    if (mode < 0) {
-        /* Screen layout milestone-0 test: 1 = the fixed test layout on every game frame, 2 = on and off in turns of 10 s (cost in the log); off otherwise. */
-        const char *e = getenv("MADEIRA_REMAP_TEST");
-        mode = (e && (*e == '1' || *e == '2')) ? *e - '0' : 0;
-        if (mode) fprintf(stderr, "[remap-test] on, mode %d\n", mode);
-    }
-    return mode;
-}
+#define MADEIRA_REMAP_MAX_ZONES 16
 
 static NSString *const kRemapMSL = @
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct Quad { float4 dst; float4 src; };\n"   // dst in NDC (x0,y0,x1,y1); src in scratch texels
+"struct Quad { float4 dst; float4 src; };\n"   // dst in NDC (x0,y0,x1,y1); src in source texels
 "struct VOut { float4 pos [[position]]; float2 uv; };\n"
 "vertex VOut remap_vs(uint vid [[vertex_id]], constant Quad &q [[buffer(0)]]) {\n"
 "  float2 c = float2(vid & 1, vid >> 1);\n"
@@ -314,175 +305,197 @@ static NSString *const kRemapMSL = @
 "  float4 acc = 0; float wsum = 0;\n"
 "  for (int j = 0; j < 6; j++) for (int i = 0; i < 6; i++) {\n"
 "    float w = wx[i] * wy[j];\n"
-"    uint2 c = uint2(clamp(f + float2(i - 2, j - 2), q.src.xy, q.src.zw - 1));\n"
+"    uint2 c = uint2(clamp(f + float2(i - 2, j - 2), q.src.xy, q.src.zw - 1));\n"   // reads stay inside the source rect
 "    acc += w * t.read(c); wsum += w;\n"
 "  }\n"
 "  return float4(clamp(acc.rgb / wsum, 0.0, 1.0), 1);\n"
 "}\n"
-"kernel void remap_signature(texture2d<float> t [[texture(0)]], device float *out [[buffer(0)]],\n"
-"                            constant float4 &r [[buffer(1)]], uint2 g [[thread_position_in_grid]]) {\n"
-"  if (g.x >= 48 || g.y >= 12) return;\n"
-"  float2 a = r.xy + (r.zw - r.xy) * float2(g) / float2(48, 12);\n"
-"  float2 b = r.xy + (r.zw - r.xy) * float2(g + 1) / float2(48, 12);\n"
-"  float s = 0; int n = 0;\n"
-"  for (int y = int(a.y); y < int(ceil(b.y)); y++) for (int x = int(a.x); x < int(ceil(b.x)); x++) {\n"
-"    s += dot(t.read(uint2(x, y)).rgb, float3(0.299, 0.587, 0.114)); n++; }\n"
-"  out[g.y * 48 + g.x] = s / max(n, 1);\n"
-"}\n";
+"fragment float4 remap_fill_fs(VOut in [[stage_in]]) { return float4(0, 0, 0, 1); }\n";
 
-// Normalised NCC of the gradient magnitudes of two 48x12 signatures (1 = same picture).
-static float madeira_remap_edge_ncc(const float *a, const float *b) {
-    float ea[576], eb[576], ma = 0, mb = 0;
-    for (int y = 0; y < 12; y++) for (int x = 0; x < 48; x++) {
-        int i = y * 48 + x;
-        float ax = (x > 0 && x < 47) ? a[i + 1] - a[i - 1] : 0, ay = (y > 0 && y < 11) ? a[i + 48] - a[i - 48] : 0;
-        float bx = (x > 0 && x < 47) ? b[i + 1] - b[i - 1] : 0, by = (y > 0 && y < 11) ? b[i + 48] - b[i - 48] : 0;
-        ea[i] = sqrtf(ax * ax + ay * ay); eb[i] = sqrtf(bx * bx + by * by); ma += ea[i]; mb += eb[i];
-    }
-    ma /= 576; mb /= 576;
-    float num = 0, da = 0, db = 0;
-    for (int i = 0; i < 576; i++) { float u = ea[i] - ma, v = eb[i] - mb; num += u * v; da += u * u; db += v * v; }
-    return num / (sqrtf(da * db) + 1e-6f);
-}
+typedef struct { float sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, hide; } MadeiraRemapZone;
 
 static struct {
     pthread_mutex_t lock;
+    _Atomic int busy;   // zones set or a capture waiting: the hook does nothing without it
+    MadeiraRemapZone zones[MADEIRA_REMAP_MAX_ZONES];
+    int count;
+    MadeiraFrameCapture capture;
     id<MTLDevice> device;
     id<MTLLibrary> library;
-    id<MTLComputePipelineState> signature;
-    NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *draw;   // by pixel format
+    NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *pipelines;   // "fs/format"
     id<MTLTexture> scratch;
-    id<MTLBuffer> sig[3];
-    unsigned sigNext;
-    float reference[576];
-    int haveReference;
-    uint64_t frames;
-    double phaseStart;
-    // per 10 s window: GPU time of the frames' command buffers, signature matches
-    double gpuSum[2]; uint64_t gpuCount[2];
-    double nccSum, nccMin; uint64_t nccCount;
     int failed;
 } g_remap = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
+static void madeira_remap_update_busy(void) {
+    g_remap.busy = g_remap.count > 0 || g_remap.capture != nil;
+}
+
+void madeira_remap_set_zones(const float *zones, int count) {
+    if (count < 0 || !zones) count = 0;
+    if (count > MADEIRA_REMAP_MAX_ZONES) count = MADEIRA_REMAP_MAX_ZONES;
+    pthread_mutex_lock(&g_remap.lock);
+    int kept = 0;
+    for (int i = 0; i < count; i++) {
+        MadeiraRemapZone z;
+        memcpy(&z, zones + i * 9, sizeof z);
+        // normalised, non-empty, inside the frame
+        if (!(z.sx0 >= 0 && z.sy0 >= 0 && z.sx1 <= 1 && z.sy1 <= 1 && z.sx1 > z.sx0 && z.sy1 > z.sy0 &&
+              z.dx0 >= 0 && z.dy0 >= 0 && z.dx1 <= 1 && z.dy1 <= 1 && z.dx1 > z.dx0 && z.dy1 > z.dy0)) continue;
+        g_remap.zones[kept++] = z;
+    }
+    g_remap.count = kept;
+    madeira_remap_update_busy();
+    pthread_mutex_unlock(&g_remap.lock);
+    fprintf(stderr, "[screen-layout] %d zone(s) applied\n", kept);
+}
+
+void madeira_remap_capture(MadeiraFrameCapture done) {
+    pthread_mutex_lock(&g_remap.lock);
+    MadeiraFrameCapture previous = g_remap.capture;
+    g_remap.capture = [done copy];
+    madeira_remap_update_busy();
+    pthread_mutex_unlock(&g_remap.lock);
+    if (previous) dispatch_async(dispatch_get_main_queue(), ^{ previous(NULL); });
+}
 
 static BOOL madeira_remap_setup(id<MTLDevice> dev) {
     if (g_remap.failed) return NO;
     if (g_remap.device == dev && g_remap.library) return YES;
     NSError *err = nil;
     id<MTLLibrary> lib = [dev newLibraryWithSource:kRemapMSL options:nil error:&err];
-    id<MTLFunction> sigFn = [lib newFunctionWithName:@"remap_signature"];
-    id<MTLComputePipelineState> sig = sigFn ? [dev newComputePipelineStateWithFunction:sigFn error:&err] : nil;
-    if (!lib || !sig) {
-        fprintf(stderr, "[remap-test] shaders failed: %s\n", err.localizedDescription.UTF8String ?: "?");
+    if (!lib) {
+        fprintf(stderr, "[screen-layout] shaders failed: %s\n", err.localizedDescription.UTF8String ?: "?");
         g_remap.failed = 1;
         return NO;
     }
-    g_remap.device = dev; g_remap.library = lib; g_remap.signature = sig;
-    g_remap.draw = [NSMutableDictionary new];
-    for (int i = 0; i < 3; i++) g_remap.sig[i] = [dev newBufferWithLength:576 * sizeof(float) options:MTLResourceStorageModeShared];
+    g_remap.device = dev; g_remap.library = lib; g_remap.scratch = nil;
+    g_remap.pipelines = [NSMutableDictionary new];
     return YES;
 }
 
-static id<MTLRenderPipelineState> madeira_remap_pipeline(MTLPixelFormat fmt) {
-    id<MTLRenderPipelineState> p = g_remap.draw[@(fmt)];
+static id<MTLRenderPipelineState> madeira_remap_pipeline(NSString *fs, MTLPixelFormat fmt) {
+    NSString *key = [NSString stringWithFormat:@"%@/%lu", fs, (unsigned long)fmt];
+    id<MTLRenderPipelineState> p = g_remap.pipelines[key];
     if (p) return p;
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = [g_remap.library newFunctionWithName:@"remap_vs"];
-    d.fragmentFunction = [g_remap.library newFunctionWithName:@"remap_fs"];
+    d.fragmentFunction = [g_remap.library newFunctionWithName:fs];
     d.colorAttachments[0].pixelFormat = fmt;
     NSError *err = nil;
     p = [g_remap.device newRenderPipelineStateWithDescriptor:d error:&err];
-    if (!p) { fprintf(stderr, "[remap-test] no pipeline for format %lu: %s\n", (unsigned long)fmt, err.localizedDescription.UTF8String ?: "?"); return nil; }
-    g_remap.draw[@(fmt)] = p;
+    if (!p) { fprintf(stderr, "[screen-layout] no %s pipeline for format %lu: %s\n", fs.UTF8String, (unsigned long)fmt, err.localizedDescription.UTF8String ?: "?"); return nil; }
+    g_remap.pipelines[key] = p;
     return p;
 }
 
-static void madeira_remap_log_window(double now) {
-    double on = g_remap.gpuCount[1] ? g_remap.gpuSum[1] / g_remap.gpuCount[1] : 0;
-    double off = g_remap.gpuCount[0] ? g_remap.gpuSum[0] / g_remap.gpuCount[0] : 0;
-    fprintf(stderr, "[remap-test] frames=%llu cmdbuf-gpu on=%.3fms(%llu) off=%.3fms(%llu) signature ncc avg=%.3f min=%.3f (%llu)\n",
-            g_remap.frames, on * 1000, g_remap.gpuCount[1], off * 1000, g_remap.gpuCount[0],
-            g_remap.nccCount ? g_remap.nccSum / g_remap.nccCount : 0, g_remap.nccCount ? g_remap.nccMin : 0, g_remap.nccCount);
-    memset(g_remap.gpuSum, 0, sizeof g_remap.gpuSum); memset(g_remap.gpuCount, 0, sizeof g_remap.gpuCount);
-    g_remap.nccSum = 0; g_remap.nccMin = 1; g_remap.nccCount = 0;
-    g_remap.phaseStart = now;
+// One quad: destination in pixels of a W x H target, source in texels of the bound texture.
+static void madeira_remap_quad(id<MTLRenderCommandEncoder> enc, double W, double H,
+                               double dx0, double dy0, double dx1, double dy1,
+                               double sx0, double sy0, double sx1, double sy1) {
+    float q[8] = { (float)(dx0 / W * 2 - 1), (float)(1 - dy0 / H * 2), (float)(dx1 / W * 2 - 1), (float)(1 - dy1 / H * 2),
+                   (float)sx0, (float)sy0, (float)sx1, (float)sy1 };
+    [enc setVertexBytes:q length:sizeof q atIndex:0];
+    [enc setFragmentBytes:q length:sizeof q atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+}
+
+// The frame as the game drew it, as an 8-bit image, for the editor.
+static void madeira_remap_encode_capture(id<MTLCommandBuffer> cb, id<MTLTexture> tex, MadeiraFrameCapture done) {
+    NSUInteger W = tex.width, H = tex.height;
+    id<MTLRenderPipelineState> pso = madeira_remap_pipeline(@"remap_fs", MTLPixelFormatBGRA8Unorm);
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:W height:H mipmapped:NO];
+    d.usage = MTLTextureUsageRenderTarget; d.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> target = [tex.device newTextureWithDescriptor:d];
+    id<MTLBuffer> bytes = [tex.device newBufferWithLength:W * H * 4 options:MTLResourceStorageModeShared];
+    if (!pso || !target || !bytes) { dispatch_async(dispatch_get_main_queue(), ^{ done(NULL); }); return; }
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = target;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:pso];
+    [enc setFragmentTexture:tex atIndex:0];
+    madeira_remap_quad(enc, W, H, 0, 0, W, H, 0, 0, W, H);   // 1:1, so Lanczos copies texels exactly
+    [enc endEncoding];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit copyFromTexture:target sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(W, H, 1)
+                 toBuffer:bytes destinationOffset:0 destinationBytesPerRow:W * 4 destinationBytesPerImage:W * H * 4];
+    [blit endEncoding];
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+        CGImageRef image = NULL;
+        if (finished.status == MTLCommandBufferStatusCompleted) {
+            CFDataRef data = CFDataCreate(NULL, bytes.contents, (CFIndex)(W * H * 4));
+            CGDataProviderRef provider = CGDataProviderCreateWithCFData(data);
+            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+            image = CGImageCreate(W, H, 8, 32, W * 4, cs, kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
+                                  provider, NULL, false, kCGRenderingIntentDefault);
+            CGColorSpaceRelease(cs); CGDataProviderRelease(provider); CFRelease(data);
+        }
+        fprintf(stderr, "[screen-layout] frame captured %lux%lu: %s\n", (unsigned long)W, (unsigned long)H, image ? "ok" : "failed");
+        dispatch_async(dispatch_get_main_queue(), ^{ done(image); if (image) CGImageRelease(image); });
+    }];
 }
 
 __attribute__((used, visibility("default")))
 void madeira_present_remap(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable) {
-    int mode = madeira_remap_test_mode();
-    if (!mode || !cb || !drawable) return;
+    if (!g_remap.busy || !cb || !drawable) return;
     id<MTLTexture> tex = drawable.texture;
     if (!tex || tex.width < 320 || tex.height < 180 || tex.framebufferOnly) return;
     pthread_mutex_lock(&g_remap.lock);
     if (!madeira_remap_setup(tex.device)) { pthread_mutex_unlock(&g_remap.lock); return; }
-    double now = CACurrentMediaTime();
-    if (!g_remap.phaseStart) { g_remap.phaseStart = now; g_remap.nccMin = 1;
-        fprintf(stderr, "[remap-test] first drawable %lux%lu format %lu\n", (unsigned long)tex.width, (unsigned long)tex.height, (unsigned long)tex.pixelFormat); }
-    if (now - g_remap.phaseStart >= 10) madeira_remap_log_window(now);
-    // mode 2: odd 10 s windows run without the layout
-    int on = mode == 1 || ((uint64_t)(now / 10) & 1) == 0;
-    uint64_t frame = g_remap.frames++;
+    MadeiraFrameCapture capture = g_remap.capture;
+    g_remap.capture = nil;
+    madeira_remap_update_busy();
+    if (capture) madeira_remap_encode_capture(cb, tex, capture);
+
+    int n = g_remap.count;
     double W = tex.width, H = tex.height;
-
-    // the anchor first: it reads the frame as the game drew it
-    if (frame % 6 == 0) {
-        id<MTLBuffer> buf = g_remap.sig[g_remap.sigNext++ % 3];
-        float r[4] = { (float)(W * 0.85), 0, (float)W, (float)(H * 0.08) };
-        id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-        [ce setComputePipelineState:g_remap.signature];
-        [ce setTexture:tex atIndex:0];
-        [ce setBuffer:buf offset:0 atIndex:0];
-        [ce setBytes:r length:sizeof r atIndex:1];
-        [ce dispatchThreads:MTLSizeMake(48, 12, 1) threadsPerThreadgroup:MTLSizeMake(16, 4, 1)];
-        [ce endEncoding];
-        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-            if (done.status != MTLCommandBufferStatusCompleted) return;
-            const float *s = buf.contents;
-            pthread_mutex_lock(&g_remap.lock);
-            if (!g_remap.haveReference) { memcpy(g_remap.reference, s, sizeof g_remap.reference); g_remap.haveReference = 1; }
-            else {
-                float n = madeira_remap_edge_ncc(g_remap.reference, s);
-                g_remap.nccSum += n; g_remap.nccCount++; if (n < g_remap.nccMin) g_remap.nccMin = n;
-            }
-            pthread_mutex_unlock(&g_remap.lock);
-        }];
+    NSUInteger sx[MADEIRA_REMAP_MAX_ZONES], sy[MADEIRA_REMAP_MAX_ZONES], sw[MADEIRA_REMAP_MAX_ZONES], sh[MADEIRA_REMAP_MAX_ZONES];
+    NSUInteger packW = 0, packH = 0;
+    for (int i = 0; i < n; i++) {
+        MadeiraRemapZone z = g_remap.zones[i];
+        // source edges on the nearest pixel (a float 492/648 times 648 is 491.99997)
+        sx[i] = (NSUInteger)MIN(lround(z.sx0 * W), (long)W - 1); sy[i] = (NSUInteger)MIN(lround(z.sy0 * H), (long)H - 1);
+        sw[i] = (NSUInteger)MAX(MIN(lround(z.sx1 * W), (long)W) - (long)sx[i], 1);
+        sh[i] = (NSUInteger)MAX(MIN(lround(z.sy1 * H), (long)H) - (long)sy[i], 1);
+        packW += sw[i]; packH = MAX(packH, sh[i]);
     }
-
-    if (on) {
-        id<MTLRenderPipelineState> pso = madeira_remap_pipeline(tex.pixelFormat);
-        NSUInteger sx = 0, sy = 0, sw = (NSUInteger)(W * 0.30), sh = (NSUInteger)(H * 0.20);
-        if (pso && sw && sh) {
-            if (!g_remap.scratch || g_remap.scratch.width != sw || g_remap.scratch.height != sh || g_remap.scratch.pixelFormat != tex.pixelFormat) {
-                MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:tex.pixelFormat width:sw height:sh mipmapped:NO];
-                d.usage = MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate;
-                g_remap.scratch = [tex.device newTextureWithDescriptor:d];
-            }
-            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-            [blit copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(sx, sy, 0)
-                       sourceSize:MTLSizeMake(sw, sh, 1) toTexture:g_remap.scratch destinationSlice:0
-                 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
-            [blit endEncoding];
-            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
-            rp.colorAttachments[0].texture = tex;
-            rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
-            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-            id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
-            [enc setRenderPipelineState:pso];
-            [enc setFragmentTexture:g_remap.scratch atIndex:0];
-            // destination: x 35%..95%, y 30%..70% (NDC y grows upwards)
-            float q[8] = { -0.30f, 0.40f, 0.90f, -0.40f, 0, 0, (float)sw, (float)sh };
-            [enc setVertexBytes:q length:sizeof q atIndex:0];
-            [enc setFragmentBytes:q length:sizeof q atIndex:0];
-            [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
-            [enc endEncoding];
+    id<MTLRenderPipelineState> draw = n ? madeira_remap_pipeline(@"remap_fs", tex.pixelFormat) : nil;
+    id<MTLRenderPipelineState> fill = n ? madeira_remap_pipeline(@"remap_fill_fs", tex.pixelFormat) : nil;
+    if (n && draw && fill && packW && packH) {
+        // the sources side by side in one scratch texture, copied before anything is drawn
+        if (!g_remap.scratch || g_remap.scratch.width < packW || g_remap.scratch.height < packH || g_remap.scratch.pixelFormat != tex.pixelFormat) {
+            MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:tex.pixelFormat
+                                       width:MAX(packW, g_remap.scratch.width) height:MAX(packH, g_remap.scratch.height) mipmapped:NO];
+            d.usage = MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate;
+            g_remap.scratch = [tex.device newTextureWithDescriptor:d];
         }
+        id<MTLTexture> scratch = g_remap.scratch;
+        NSUInteger at[MADEIRA_REMAP_MAX_ZONES], x = 0;
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        for (int i = 0; i < n; i++) {
+            [blit copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(sx[i], sy[i], 0)
+                       sourceSize:MTLSizeMake(sw[i], sh[i], 1) toTexture:scratch destinationSlice:0
+                 destinationLevel:0 destinationOrigin:MTLOriginMake(x, 0, 0)];
+            at[i] = x; x += sw[i];
+        }
+        [blit endEncoding];
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = tex;
+        rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        [enc setRenderPipelineState:fill];
+        for (int i = 0; i < n; i++)
+            if (g_remap.zones[i].hide) madeira_remap_quad(enc, W, H, sx[i], sy[i], sx[i] + sw[i], sy[i] + sh[i], 0, 0, 1, 1);
+        [enc setRenderPipelineState:draw];
+        [enc setFragmentTexture:scratch atIndex:0];
+        for (int i = 0; i < n; i++) {
+            MadeiraRemapZone z = g_remap.zones[i];
+            madeira_remap_quad(enc, W, H, z.dx0 * W, z.dy0 * H, z.dx1 * W, z.dy1 * H, at[i], 0, at[i] + sw[i], sh[i]);
+        }
+        [enc endEncoding];
     }
-    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-        double t = done.GPUEndTime - done.GPUStartTime;
-        if (t <= 0 || t > 1) return;
-        pthread_mutex_lock(&g_remap.lock);
-        g_remap.gpuSum[on] += t; g_remap.gpuCount[on]++;
-        pthread_mutex_unlock(&g_remap.lock);
-    }];
     pthread_mutex_unlock(&g_remap.lock);
 }

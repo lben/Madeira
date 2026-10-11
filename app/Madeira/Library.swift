@@ -280,6 +280,9 @@ struct LibraryEntry: Codable, Identifiable {
     /// MetalFX spatial upscaling factor (Display › MetalFX upscaling: 1.5 or 2;
     /// nil = off), passed on as this game's `metalfx-upscale` line.
     var metalFXUpscale: Double?
+    /// The game's screen layout (in-game menu › Screen layout, ScreenLayouts): parts
+    /// of its frame drawn again elsewhere, larger. nil: none.
+    var screenZones: [ScreenZone]?
 
     /// What MadeiraConfig.applyGame writes for this game: the lines its pickers
     /// stand for, then its own config, which wins where both set a key.
@@ -636,7 +639,9 @@ final class LibraryModel: ObservableObject {
     var menuButtonRect = CGRect.zero
     var performanceRect = CGRect.zero
     /// The in-game menu and the starting screen take every touch.
-    var blocksGameplayTouch: Bool { current != nil && (menu || launching) }
+    var blocksGameplayTouch: Bool { current != nil && (menu || launching || layoutEditing) }
+    /// The screen layout editor (ScreenLayoutEditor) is up.
+    @Published var layoutEditing = false
     private var timer: Timer?
     private var sawProcess = false
     // Why a session ended by itself (not Quit): the program the app launched
@@ -1043,6 +1048,7 @@ final class LibraryModel: ObservableObject {
         padMouseVertical = GamepadInput.keyboardMouseAvailable ? (entry.padMouseVertical ?? 1) : 1
         controllerMode = GamepadInput.keyboardMouseAvailable ? entry.controllerMode : nil
         applyControllerMode()
+        ScreenLayouts.apply(entry.screenZones)
         MetalHostView.shared.isHidden = false
         ProMotionIntent.apply(mode: entry.effectiveFPSMode)
         if remember { var played = entry; played.lastPlayed = Date(); save(played) }
@@ -1150,6 +1156,15 @@ final class LibraryModel: ObservableObject {
         menu = false
         fputs("[frontend] graceful close requested\n", stderr)
     }
+    /// The running game's screen layout, from its editor: stored with the game and
+    /// applied at once.
+    func saveScreenZones(_ zones: [ScreenZone]) {
+        guard let id = current, var entry = entries.first(where: { $0.id == id }) else { return }
+        entry.screenZones = zones.isEmpty ? nil : zones
+        save(entry)
+        activeEntry?.screenZones = entry.screenZones
+        ScreenLayouts.apply(entry.screenZones)
+    }
     func saveCurrentProfile() {
         let controls = TouchControlsModel.shared
         if let id = current, var entry = entries.first(where: { $0.id == id }) {
@@ -1170,6 +1185,7 @@ final class LibraryModel: ObservableObject {
     }
     private func finish() {
         if sawProcess, let report = exitReport() { error = report }
+        ScreenLayouts.apply(nil); layoutEditing = false
         timer?.invalidate(); timer = nil
         saveCurrentProfile()
         controllerMode = nil
@@ -3880,6 +3896,7 @@ struct LibraryHUD: View {
                 if model.liveLogs && !model.launching { LibraryLiveLogs().frame(maxWidth: 550, maxHeight: 140).padding(.top, Self.topInset(geo) + 60).padding(.horizontal, 12).allowsHitTesting(false) }
                 if !model.sessionMessage.isEmpty { Text(model.sessionMessage).font(.caption).padding(10).background(.regularMaterial, in: Capsule()).frame(maxWidth: .infinity).padding(.top, Self.topInset(geo) + 12).allowsHitTesting(false) }
                 if !model.launching { LibraryFloatingItem(isMenu: true, viewport: geo.size, insets: geo.safeAreaInsets) }
+                if model.layoutEditing { ScreenLayoutEditor() }
                 if model.menu {
                     Color.black.opacity(0.5).ignoresSafeArea().onTapGesture { model.menu = false }.transition(.opacity)
                     (bindsPage ? AnyView(bindsMenu) : AnyView(menu))
@@ -4068,6 +4085,10 @@ struct LibraryHUD: View {
                     }
                 }
                 Button("Keyboard", systemImage: "keyboard") { model.menu = false; LibraryKeyboard.show() }
+                // A game in the library: its layout is stored with it.
+                if ScreenLayouts.enabled, let id = model.current, model.entries.contains(where: { $0.id == id }) {
+                    Button("Screen layout", systemImage: "rectangle.dashed.and.paperclip") { model.menu = false; model.layoutEditing = true }
+                }
                 Divider()
                 FPSChoice(mode: Binding(get: { model.fpsMode }, set: { model.setFPS($0) }))
                 // Saved to the game with the rest of the session's profile.
@@ -4399,5 +4420,222 @@ enum EndedSessionSurface {
         hiddenByUs = false
         _ = winios_compositor_set_hidden(0)
         LogStore.shared.log("[library-surface] desktop shown for the new session")
+    }
+}
+
+// MARK: - Screen layouts
+
+/// One zone of a game's screen layout: the `source` rect of the game's frame is drawn
+/// again at `destination`, both normalised (0...1, origin top-left), and the source may
+/// be blacked out. IOSDisplayShim.m draws it as the last step on every game frame; a
+/// touch on the copy goes to the same spot of the source (ScreenLayouts.touch).
+struct ScreenZone: Codable, Equatable {
+    var source: CGRect
+    var destination: CGRect
+    var hideSource: Bool?
+}
+
+enum ScreenLayouts {
+    /// `env.MADEIRA_SCREEN_LAYOUTS = 0` hides the editor and draws no layout.
+    static var enabled: Bool { MadeiraConfig.flag("MADEIRA_SCREEN_LAYOUTS") }
+
+    /// Hands the running game's zones to the present step (nil: none).
+    static func apply(_ zones: [ScreenZone]?) {
+        let list = enabled ? (zones ?? []) : []
+        let floats = list.flatMap { z -> [Float] in
+            [z.source.minX, z.source.minY, z.source.maxX, z.source.maxY,
+             z.destination.minX, z.destination.minY, z.destination.maxX, z.destination.maxY,
+             z.hideSource == true ? 1 : 0].map { Float($0) }
+        }
+        floats.withUnsafeBufferPointer { madeira_remap_set_zones($0.baseAddress, Int32(list.count)) }
+    }
+
+    /// A touch at `point` (guest pixels) on a zone's copy, mapped to the same spot of its
+    /// source. `frame` is the rect, in the same pixels, that the game's frame covers.
+    static func touch(_ point: CGPoint, frame: CGRect) -> CGPoint {
+        guard enabled, let zones = LibraryModel.shared.activeEntry?.screenZones, !zones.isEmpty,
+              frame.width > 0, frame.height > 0 else { return point }
+        let n = CGPoint(x: (point.x - frame.minX) / frame.width, y: (point.y - frame.minY) / frame.height)
+        // The last zone is drawn on top.
+        guard let z = zones.last(where: { $0.destination.contains(n) }) else { return point }
+        let u = z.source.minX + (n.x - z.destination.minX) / z.destination.width * z.source.width
+        let v = z.source.minY + (n.y - z.destination.minY) / z.destination.height * z.source.height
+        return CGPoint(x: frame.minX + u * frame.width, y: frame.minY + v * frame.height)
+    }
+
+    /// `r` moved (and if needed shrunk, keeping its shape) to lie inside the unit square.
+    static func inside(_ r: CGRect) -> CGRect {
+        let k = min(1, 1 / max(r.width, 1e-6), 1 / max(r.height, 1e-6))
+        var out = CGRect(x: r.midX - r.width * k / 2, y: r.midY - r.height * k / 2, width: r.width * k, height: r.height * k)
+        out.origin.x = min(max(out.minX, 0), 1 - out.width)
+        out.origin.y = min(max(out.minY, 0), 1 - out.height)
+        return out
+    }
+}
+
+/// In-game menu › Screen layout: the game's frame, frozen. Add zone, then drag over
+/// what should be larger; drag the copy where it should go and set its size. Save
+/// stores the layout with the game.
+struct ScreenLayoutEditor: View {
+    @ObservedObject private var model = LibraryModel.shared
+    @State private var image: CGImage?
+    @State private var failed = false
+    @State private var zones: [ScreenZone] = []
+    @State private var selected: Int?
+    @State private var adding = false
+    @State private var marking: CGRect?
+    @State private var markStart: CGPoint?
+    @State private var moveFrom: CGRect?
+    @State private var toolbarAtTop = true
+    @State private var attempt = 0
+
+    var body: some View {
+        GeometryReader { geo in
+            let frame = fitted(in: geo.size)
+            ZStack(alignment: .topLeading) {
+                Color.black
+                if let image {
+                    Image(decorative: image, scale: 1).resizable().interpolation(.high)
+                        .frame(width: frame.width, height: frame.height)
+                        .contentShape(Rectangle())
+                        .gesture(markGesture(frame), including: adding ? .all : .none)
+                        .onTapGesture { if !adding { selected = nil } }
+                        .offset(x: frame.minX, y: frame.minY)
+                    ForEach(zones.indices, id: \.self) { i in zoneView(i, image: image, frame: frame) }
+                    if let m = marking {
+                        Rectangle().stroke(.yellow, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+                            .frame(width: m.width * frame.width, height: m.height * frame.height)
+                            .offset(x: frame.minX + m.minX * frame.width, y: frame.minY + m.minY * frame.height)
+                            .allowsHitTesting(false)
+                    }
+                } else {
+                    VStack(spacing: 12) {
+                        if failed {
+                            Text("The game's screen could not be read.").font(.headline)
+                            Button("Try again") { capture() }.buttonStyle(.borderedProminent)
+                        } else {
+                            ProgressView().tint(.white)
+                            Text("Reading the game's screen…").font(.caption)
+                        }
+                    }.frame(width: geo.size.width, height: geo.size.height)
+                }
+                toolbar.frame(width: geo.size.width, height: geo.size.height, alignment: toolbarAtTop ? .top : .bottom)
+            }
+        }
+        .ignoresSafeArea()
+        .preferredColorScheme(.dark)
+        .onAppear {
+            zones = model.activeEntry?.screenZones ?? []
+            capture()
+        }
+    }
+
+    private var toolbar: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 10) {
+                Button("Cancel") { model.layoutEditing = false }
+                Spacer()
+                if adding {
+                    Text("Drag over what you want larger").font(.caption)
+                    Button("Stop") { adding = false; marking = nil }
+                } else {
+                    Button("Add zone", systemImage: "plus.rectangle.on.rectangle") { adding = true; selected = nil }.disabled(image == nil || zones.count >= 16)
+                }
+                Button(toolbarAtTop ? "Move bar down" : "Move bar up", systemImage: toolbarAtTop ? "arrow.down.to.line" : "arrow.up.to.line") { toolbarAtTop.toggle() }
+                    .labelStyle(.iconOnly)
+                Spacer()
+                Button("Save") { model.saveScreenZones(zones); model.layoutEditing = false }.buttonStyle(.borderedProminent)
+            }
+            if let i = selected, zones.indices.contains(i) {
+                HStack(spacing: 14) {
+                    Text("Size").font(.caption)
+                    Slider(value: Binding(get: { zones[i].destination.width / zones[i].source.width },
+                                          set: { resize(i, scale: $0) }), in: 0.5...4)
+                        .frame(maxWidth: 220)
+                    Text(String(format: "%.1f×", zones[i].destination.width / zones[i].source.width)).font(.caption.monospacedDigit())
+                    Toggle("Hide original", isOn: Binding(get: { zones[i].hideSource == true },
+                                                          set: { zones[i].hideSource = $0 ? true : nil })).fixedSize()
+                    Button("Delete", systemImage: "trash", role: .destructive) { zones.remove(at: i); selected = nil }
+                }
+            }
+        }
+        .padding(.horizontal, 16).padding(.vertical, 10)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+        .padding(.horizontal, 60).padding(.vertical, 8)
+    }
+
+    /// The frozen frame, as large as fits.
+    private func fitted(in size: CGSize) -> CGRect {
+        guard let image, image.width > 0, image.height > 0 else { return CGRect(origin: .zero, size: size) }
+        let k = min(size.width / CGFloat(image.width), size.height / CGFloat(image.height))
+        let w = CGFloat(image.width) * k, h = CGFloat(image.height) * k
+        return CGRect(x: (size.width - w) / 2, y: (size.height - h) / 2, width: w, height: h)
+    }
+
+    private func zoneView(_ i: Int, image: CGImage, frame: CGRect) -> some View {
+        let z = zones[i], chosen = selected == i
+        let src = CGRect(x: frame.minX + z.source.minX * frame.width, y: frame.minY + z.source.minY * frame.height,
+                         width: z.source.width * frame.width, height: z.source.height * frame.height)
+        let dst = CGRect(x: frame.minX + z.destination.minX * frame.width, y: frame.minY + z.destination.minY * frame.height,
+                         width: z.destination.width * frame.width, height: z.destination.height * frame.height)
+        let pixels = CGRect(x: z.source.minX * CGFloat(image.width), y: z.source.minY * CGFloat(image.height),
+                            width: z.source.width * CGFloat(image.width), height: z.source.height * CGFloat(image.height)).integral
+        return ZStack(alignment: .topLeading) {
+            if z.hideSource == true { Rectangle().fill(.black).frame(width: src.width, height: src.height).offset(x: src.minX, y: src.minY) }
+            Rectangle().stroke(chosen ? .yellow : .white.opacity(0.7), style: StrokeStyle(lineWidth: 1.5, dash: [5, 4]))
+                .frame(width: src.width, height: src.height).offset(x: src.minX, y: src.minY).allowsHitTesting(false)
+            Group {
+                if let piece = image.cropping(to: pixels) {
+                    Image(decorative: piece, scale: 1).resizable().interpolation(.high)
+                } else { Color.gray }
+            }
+            .frame(width: dst.width, height: dst.height)
+            .overlay(Rectangle().stroke(chosen ? .yellow : .white, lineWidth: chosen ? 3 : 1.5))
+            .contentShape(Rectangle())
+            .onTapGesture { selected = i; adding = false }
+            .gesture(DragGesture(minimumDistance: 2).onChanged { g in
+                selected = i
+                let from = moveFrom ?? zones[i].destination
+                moveFrom = from
+                zones[i].destination = ScreenLayouts.inside(from.offsetBy(dx: g.translation.width / frame.width,
+                                                                          dy: g.translation.height / frame.height))
+            }.onEnded { _ in moveFrom = nil })
+            .offset(x: dst.minX, y: dst.minY)
+        }
+    }
+
+    private func markGesture(_ frame: CGRect) -> some Gesture {
+        DragGesture(minimumDistance: 4, coordinateSpace: .local).onChanged { g in
+            let a = CGPoint(x: g.startLocation.x / frame.width, y: g.startLocation.y / frame.height)
+            let b = CGPoint(x: g.location.x / frame.width, y: g.location.y / frame.height)
+            marking = CGRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(a.x - b.x), height: abs(a.y - b.y))
+                .intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+        }.onEnded { _ in
+            defer { marking = nil }
+            guard let m = marking, m.width > 0.01, m.height > 0.01 else { return }
+            // The copy starts twice as large, in the middle of the screen.
+            let copy = ScreenLayouts.inside(CGRect(x: 0.5 - m.width, y: 0.5 - m.height, width: m.width * 2, height: m.height * 2))
+            zones.append(ScreenZone(source: m, destination: copy))
+            selected = zones.count - 1
+            adding = false
+        }
+    }
+
+    private func resize(_ i: Int, scale: Double) {
+        let s = zones[i].source, d = zones[i].destination
+        zones[i].destination = ScreenLayouts.inside(CGRect(x: d.midX - s.width * scale / 2, y: d.midY - s.height * scale / 2,
+                                                           width: s.width * scale, height: s.height * scale))
+    }
+
+    private func capture() {
+        image = nil; failed = false
+        attempt += 1
+        let mine = attempt
+        madeira_remap_capture { frame in
+            guard mine == attempt else { return }
+            if let frame { image = frame } else { failed = true }
+        }
+        // A game that presents no frame (paused on a static screen) leaves the request open.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { if mine == attempt && image == nil { failed = true } }
     }
 }
