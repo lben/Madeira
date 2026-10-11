@@ -312,14 +312,10 @@ final class MetalBackedView: UIView {
             let w = convert(p, to: nil)
             var px: Int32 = 0, py: Int32 = 0
             _ = winios_desktop_point_from_window(Double(w.x), Double(w.y), &px, &py)
-            // A touch on a screen layout's copy goes to what it shows.
-            var fx = 0.0, fy = 0.0, fw = 0.0, fh = 0.0
-            if winios_game_client_rect(&fx, &fy, &fw, &fh) != 0 {
-                let q = ScreenLayouts.touch(CGPoint(x: CGFloat(px), y: CGFloat(py)), frame: CGRect(x: fx, y: fy, width: fw, height: fh))
-                px = Int32(q.x); py = Int32(q.y)
-            }
             Self.cursor = CGPoint(x: CGFloat(px), y: CGFloat(py))   // keep the trackpad cursor in step
-            return (px, py)
+            // A touch on a screen layout's copy goes to what it shows.
+            let q = Self.layoutPoint(Self.cursor)
+            return (Int32(q.x), Int32(q.y))
         }
         let guest = guestSize()
         let g = ScreenLayouts.touch(GameSurfaceLayout.map(point: p, guest: guest, aspect: drawableAspect(),
@@ -533,7 +529,18 @@ final class MetalBackedView: UIView {
         return i
     }
     private func postPointer(_ flags: UInt32, data: Int32 = 0) {
-        winios_pointer(Int32(Self.cursor.x), Int32(Self.cursor.y), flags, UInt32(bitPattern: data))
+        // Trackpad over a screen layout's copy: the game gets the spot the copy shows, and
+        // the drawn arrow stays on the copy (it moves only with what is posted here).
+        let p = InputSettings.shared.relative ? Self.cursor : Self.layoutPoint(Self.cursor)
+        winios_pointer(Int32(p.x), Int32(p.y), flags, UInt32(bitPattern: data))
+        if p != Self.cursor && flags & F_MOVE != 0 && flags & F_ABS != 0 { winios_cursor_move(Int32(Self.cursor.x), Int32(Self.cursor.y)) }
+    }
+    /// Screen layouts, Dock desktop: a desktop-pixel point on a copy, mapped to the spot it shows.
+    static func layoutPoint(_ p: CGPoint) -> CGPoint {
+        guard ScreenLayouts.drawn != nil else { return p }
+        var fx = 0.0, fy = 0.0, fw = 0.0, fh = 0.0
+        guard winios_game_client_rect(&fx, &fy, &fw, &fh) != 0 else { return p }
+        return ScreenLayouts.touch(p, frame: CGRect(x: fx, y: fy, width: fw, height: fh))
     }
     private func avgPoint(_ touches: [UITouch]) -> CGPoint {
         var x: CGFloat = 0, y: CGFloat = 0

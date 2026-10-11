@@ -642,6 +642,10 @@ final class LibraryModel: ObservableObject {
     var blocksGameplayTouch: Bool { current != nil && (menu || launching || layoutEditing) }
     /// The screen layout editor (ScreenLayoutEditor) is up.
     @Published var layoutEditing = false
+    /// In-game menu › Show screen layout off: this session draws none (not stored).
+    @Published var layoutHidden = false {
+        didSet { if layoutHidden != oldValue { ScreenLayouts.apply(layoutHidden ? nil : activeEntry?.screenZones) } }
+    }
     private var timer: Timer?
     private var sawProcess = false
     // Why a session ended by itself (not Quit): the program the app launched
@@ -1048,6 +1052,7 @@ final class LibraryModel: ObservableObject {
         padMouseVertical = GamepadInput.keyboardMouseAvailable ? (entry.padMouseVertical ?? 1) : 1
         controllerMode = GamepadInput.keyboardMouseAvailable ? entry.controllerMode : nil
         applyControllerMode()
+        layoutHidden = false
         ScreenLayouts.apply(entry.screenZones)
         MetalHostView.shared.isHidden = false
         ProMotionIntent.apply(mode: entry.effectiveFPSMode)
@@ -1163,6 +1168,7 @@ final class LibraryModel: ObservableObject {
         entry.screenZones = zones.isEmpty ? nil : zones
         save(entry)
         activeEntry?.screenZones = entry.screenZones
+        layoutHidden = false
         ScreenLayouts.apply(entry.screenZones)
     }
     func saveCurrentProfile() {
@@ -4088,6 +4094,9 @@ struct LibraryHUD: View {
                 // A game in the library: its layout is stored with it.
                 if ScreenLayouts.enabled, let id = model.current, model.entries.contains(where: { $0.id == id }) {
                     Button("Screen layout", systemImage: "rectangle.dashed.and.paperclip") { model.menu = false; model.layoutEditing = true }
+                    if model.activeEntry?.screenZones?.isEmpty == false {
+                        Toggle("Show screen layout", isOn: Binding(get: { !model.layoutHidden }, set: { model.layoutHidden = !$0 }))
+                    }
                 }
                 Divider()
                 FPSChoice(mode: Binding(get: { model.fpsMode }, set: { model.setFPS($0) }))
@@ -4452,9 +4461,15 @@ enum ScreenLayouts {
 
     /// A touch at `point` (guest pixels) on a zone's copy, mapped to the same spot of its
     /// source. `frame` is the rect, in the same pixels, that the game's frame covers.
+    /// The zones the running game draws now (nil: none).
+    static var drawn: [ScreenZone]? {
+        let model = LibraryModel.shared
+        guard !model.layoutHidden, let zones = model.activeEntry?.screenZones, !zones.isEmpty, enabled else { return nil }
+        return zones
+    }
+
     static func touch(_ point: CGPoint, frame: CGRect) -> CGPoint {
-        guard let zones = LibraryModel.shared.activeEntry?.screenZones, !zones.isEmpty,
-              frame.width > 0, frame.height > 0, enabled else { return point }
+        guard frame.width > 0, frame.height > 0, let zones = drawn else { return point }
         let n = CGPoint(x: (point.x - frame.minX) / frame.width, y: (point.y - frame.minY) / frame.height)
         // The last zone is drawn on top.
         guard let z = zones.last(where: { $0.destination.contains(n) }) else { return point }
@@ -4501,7 +4516,7 @@ struct ScreenLayoutEditor: View {
                         .gesture(markGesture(frame), including: adding ? .all : .none)
                         .onTapGesture { if !adding { selected = nil } }
                         .offset(x: frame.minX, y: frame.minY)
-                    ForEach(zones.indices, id: \.self) { i in zoneView(i, image: image, frame: frame) }
+                    ForEach(Array(zones.enumerated()), id: \.offset) { i, z in zoneView(i, z, image: image, frame: frame) }
                     if let m = marking {
                         Rectangle().stroke(.yellow, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
                             .frame(width: m.width * frame.width, height: m.height * frame.height)
@@ -4526,6 +4541,7 @@ struct ScreenLayoutEditor: View {
         .preferredColorScheme(.dark)
         .onAppear {
             zones = model.activeEntry?.screenZones ?? []
+            selected = zones.isEmpty ? nil : 0
             capture()
         }
     }
@@ -4546,16 +4562,30 @@ struct ScreenLayoutEditor: View {
                 Spacer()
                 Button("Save") { model.saveScreenZones(zones); model.layoutEditing = false }.buttonStyle(.borderedProminent)
             }
-            if let i = selected, zones.indices.contains(i) {
+            if !zones.isEmpty && !adding {
+                HStack(spacing: 8) {
+                    Text(selected == nil ? "Tap a copy, or pick a zone, to change it:" : "Zone").font(.caption)
+                    ForEach(zones.indices, id: \.self) { i in
+                        Button("\(i + 1)") { selected = i }
+                            .buttonStyle(.bordered).tint(selected == i ? .yellow : .gray)
+                    }
+                }
+            }
+            if let i = selected, zones.indices.contains(i), !adding {
+                let scale = zones[i].destination.width / zones[i].source.width
                 HStack(spacing: 14) {
                     Text("Size").font(.caption)
-                    Slider(value: Binding(get: { zones[i].destination.width / zones[i].source.width },
-                                          set: { resize(i, scale: $0) }), in: 0.5...4)
+                    // The bindings run after a Delete has removed the zone, so they check it is still there.
+                    Slider(value: Binding(get: { zones.indices.contains(i) ? zones[i].destination.width / zones[i].source.width : 1 },
+                                          set: { if zones.indices.contains(i) { resize(i, scale: $0) } }), in: 0.5...4)
                         .frame(maxWidth: 220)
-                    Text(String(format: "%.1f×", zones[i].destination.width / zones[i].source.width)).font(.caption.monospacedDigit())
-                    Toggle("Hide original", isOn: Binding(get: { zones[i].hideSource == true },
-                                                          set: { zones[i].hideSource = $0 ? true : nil })).fixedSize()
-                    Button("Delete", systemImage: "trash", role: .destructive) { zones.remove(at: i); selected = nil }
+                    Text(String(format: "%.1f×", scale)).font(.caption.monospacedDigit())
+                    Toggle("Hide original", isOn: Binding(get: { zones.indices.contains(i) && zones[i].hideSource == true },
+                                                          set: { if zones.indices.contains(i) { zones[i].hideSource = $0 ? true : nil } })).fixedSize()
+                    Button("Delete", systemImage: "trash", role: .destructive) {
+                        selected = nil
+                        if zones.indices.contains(i) { zones.remove(at: i) }
+                    }
                 }
             }
         }
@@ -4572,8 +4602,8 @@ struct ScreenLayoutEditor: View {
         return CGRect(x: (size.width - w) / 2, y: (size.height - h) / 2, width: w, height: h)
     }
 
-    private func zoneView(_ i: Int, image: CGImage, frame: CGRect) -> some View {
-        let z = zones[i], chosen = selected == i
+    private func zoneView(_ i: Int, _ z: ScreenZone, image: CGImage, frame: CGRect) -> some View {
+        let chosen = selected == i
         let src = CGRect(x: frame.minX + z.source.minX * frame.width, y: frame.minY + z.source.minY * frame.height,
                          width: z.source.width * frame.width, height: z.source.height * frame.height)
         let dst = CGRect(x: frame.minX + z.destination.minX * frame.width, y: frame.minY + z.destination.minY * frame.height,
@@ -4595,6 +4625,7 @@ struct ScreenLayoutEditor: View {
             .onTapGesture { selected = i; adding = false }
             // Global: the copy moves under the finger, so a local translation would feed back.
             .gesture(DragGesture(minimumDistance: 2, coordinateSpace: .global).onChanged { g in
+                guard zones.indices.contains(i) else { return }
                 selected = i
                 let from = moveFrom ?? zones[i].destination
                 moveFrom = from
