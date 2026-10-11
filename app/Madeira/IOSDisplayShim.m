@@ -472,6 +472,7 @@ void madeira_present_remap(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable
             g_remap.scratch = [tex.device newTextureWithDescriptor:d];
         }
         id<MTLTexture> scratch = g_remap.scratch;
+        if (!scratch) { pthread_mutex_unlock(&g_remap.lock); return; }
         NSUInteger at[MADEIRA_REMAP_MAX_ZONES], x = 0;
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
         for (int i = 0; i < n; i++) {

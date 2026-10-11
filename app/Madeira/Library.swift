@@ -4453,8 +4453,8 @@ enum ScreenLayouts {
     /// A touch at `point` (guest pixels) on a zone's copy, mapped to the same spot of its
     /// source. `frame` is the rect, in the same pixels, that the game's frame covers.
     static func touch(_ point: CGPoint, frame: CGRect) -> CGPoint {
-        guard enabled, let zones = LibraryModel.shared.activeEntry?.screenZones, !zones.isEmpty,
-              frame.width > 0, frame.height > 0 else { return point }
+        guard let zones = LibraryModel.shared.activeEntry?.screenZones, !zones.isEmpty,
+              frame.width > 0, frame.height > 0, enabled else { return point }
         let n = CGPoint(x: (point.x - frame.minX) / frame.width, y: (point.y - frame.minY) / frame.height)
         // The last zone is drawn on top.
         guard let z = zones.last(where: { $0.destination.contains(n) }) else { return point }
@@ -4581,7 +4581,7 @@ struct ScreenLayoutEditor: View {
         let pixels = CGRect(x: z.source.minX * CGFloat(image.width), y: z.source.minY * CGFloat(image.height),
                             width: z.source.width * CGFloat(image.width), height: z.source.height * CGFloat(image.height)).integral
         return ZStack(alignment: .topLeading) {
-            if z.hideSource == true { Rectangle().fill(.black).frame(width: src.width, height: src.height).offset(x: src.minX, y: src.minY) }
+            if z.hideSource == true { Rectangle().fill(.black).frame(width: src.width, height: src.height).offset(x: src.minX, y: src.minY).allowsHitTesting(false) }
             Rectangle().stroke(chosen ? .yellow : .white.opacity(0.7), style: StrokeStyle(lineWidth: 1.5, dash: [5, 4]))
                 .frame(width: src.width, height: src.height).offset(x: src.minX, y: src.minY).allowsHitTesting(false)
             Group {
@@ -4593,7 +4593,8 @@ struct ScreenLayoutEditor: View {
             .overlay(Rectangle().stroke(chosen ? .yellow : .white, lineWidth: chosen ? 3 : 1.5))
             .contentShape(Rectangle())
             .onTapGesture { selected = i; adding = false }
-            .gesture(DragGesture(minimumDistance: 2).onChanged { g in
+            // Global: the copy moves under the finger, so a local translation would feed back.
+            .gesture(DragGesture(minimumDistance: 2, coordinateSpace: .global).onChanged { g in
                 selected = i
                 let from = moveFrom ?? zones[i].destination
                 moveFrom = from
@@ -4601,6 +4602,7 @@ struct ScreenLayoutEditor: View {
                                                                           dy: g.translation.height / frame.height))
             }.onEnded { _ in moveFrom = nil })
             .offset(x: dst.minX, y: dst.minY)
+            .allowsHitTesting(!adding)
         }
     }
 
