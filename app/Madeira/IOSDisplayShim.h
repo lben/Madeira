@@ -21,9 +21,10 @@ extern NSString * const MadeiraDisplayModeChangedNotification;
 
 // Screen layouts (the last step on a game frame, see IOSDisplayShim.m).
 // `layoutCount` layouts (at most 8; 0 clears them). Layout l has zoneCounts[l]
-// zones, taken in order from `zones`, 9 floats each in the frame's normalised
+// zones, taken in order from `zones`, 10 floats each in the frame's normalised
 // coordinates (origin top-left): source x0 y0 x1 y1, destination x0 y0 x1 y1, hide
-// (1 = black out the source). anchors[l*4..]: its anchor rect, x0 y0 x1 y1, or -1s
+// (0 no, 1 black, 2 blended from the pixels around it), sharp (1 = square pixels,
+// for pixel art; 0 = smooth Lanczos-3). anchors[l*4..]: its anchor rect, x0 y0 x1 y1, or -1s
 // for none; signatures[l*576..]: the anchor's 48x12 luma reference (row-major,
 // 0..1, box averages as the hook's remap_signature kernel computes them).
 void madeira_remap_set_layouts(int layoutCount, const int *zoneCounts, const float *zones,

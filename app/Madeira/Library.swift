@@ -1055,6 +1055,7 @@ final class LibraryModel: ObservableObject {
         padMouseVertical = GamepadInput.keyboardMouseAvailable ? (entry.padMouseVertical ?? 1) : 1
         controllerMode = GamepadInput.keyboardMouseAvailable ? entry.controllerMode : nil
         applyControllerMode()
+        ScreenZoom.reset()
         layoutHidden = false
         ScreenLayouts.apply(entry.layouts)
         MetalHostView.shared.isHidden = false
@@ -1195,6 +1196,7 @@ final class LibraryModel: ObservableObject {
     private func finish() {
         if sawProcess, let report = exitReport() { error = report }
         ScreenLayouts.apply(nil); layoutEditing = false
+        ScreenZoom.reset()
         timer?.invalidate(); timer = nil
         saveCurrentProfile()
         controllerMode = nil
@@ -4094,6 +4096,10 @@ struct LibraryHUD: View {
                     }
                 }
                 Button("Keyboard", systemImage: "keyboard") { model.menu = false; LibraryKeyboard.show() }
+                // Pinch to zoom (ScreenZoom): two fingers apart or together.
+                if ScreenZoom.zoomed {
+                    Button("Reset zoom", systemImage: "arrow.down.right.and.arrow.up.left") { ScreenZoom.reset(); model.menu = false }
+                }
                 // A game in the library: its layout is stored with it.
                 if ScreenLayouts.enabled, let id = model.current, model.entries.contains(where: { $0.id == id }) {
                     Button("Screen layout", systemImage: "rectangle.dashed.and.paperclip") { model.menu = false; model.layoutEditing = true }
@@ -4445,6 +4451,10 @@ struct ScreenZone: Codable, Equatable {
     var source: CGRect
     var destination: CGRect
     var hideSource: Bool?
+    /// With `hideSource`: fill the source from the pixels around it instead of black.
+    var blendSource: Bool?
+    /// Square pixels (pixel art) instead of the smooth Lanczos filter.
+    var sharp: Bool?
 }
 
 /// One screen of a game (its menu, its game view, a shop): the zones drawn while it is
@@ -4479,7 +4489,7 @@ enum ScreenLayouts {
             for z in layout.zones {
                 zones += [z.source.minX, z.source.minY, z.source.maxX, z.source.maxY,
                           z.destination.minX, z.destination.minY, z.destination.maxX, z.destination.maxY,
-                          z.hideSource == true ? 1 : 0].map { Float($0) }
+                          z.hideSource == true ? (z.blendSource == true ? 2 : 1) : 0, z.sharp == true ? 1 : 0].map { Float($0) }
             }
             if layout.anchored, let a = layout.anchor, let sig = layout.signature {
                 anchors += [a.minX, a.minY, a.maxX, a.maxY].map { Float($0) }
@@ -4556,9 +4566,11 @@ enum ScreenLayouts {
 
 /// In-game menu › Screen layout: the game's frame, frozen. A game has screens (1, 2, …),
 /// each with its zones and, to tell it apart, an anchor: Add zone, then drag over what
-/// should be larger, drag the copy where it should go and set its size; Set anchor,
-/// then drag over something that is always on this screen and only on it. Save stores
-/// the screens with the game.
+/// should be larger; the enlarged zone can be dragged, sized from its corner, the slider
+/// or − / +, and the marked part changed from its corners. Set anchor, then drag over
+/// something that is always on this screen and only on it. The bar can be dragged by its
+/// grip, folded into a button, and hides itself while you mark. Save stores the screens
+/// with the game.
 struct ScreenLayoutEditor: View {
     @ObservedObject private var model = LibraryModel.shared
     @State private var image: CGImage?
@@ -4569,9 +4581,13 @@ struct ScreenLayoutEditor: View {
     @State private var mode = Mode.none
     @State private var marking: CGRect?
     @State private var moveFrom: CGRect?
-    @State private var toolbarAtTop = true
     @State private var attempt = 0
+    // The bar: where it is (dragged by its grip), and whether it is folded into a button.
+    @State private var bar = CGPoint(x: 0.5, y: 0.2)
+    @State private var barFrom: CGPoint?
+    @State private var folded = false
     private enum Mode { case none, zone, anchor }
+    private static let scales: ClosedRange<Double> = 0.5...6
 
     /// The current screen's zones (every reader checks the index: a Delete can run first).
     private var zones: [ScreenZone] {
@@ -4615,7 +4631,7 @@ struct ScreenLayoutEditor: View {
                         }
                     }.frame(width: geo.size.width, height: geo.size.height)
                 }
-                toolbar.frame(width: geo.size.width, height: geo.size.height, alignment: toolbarAtTop ? .top : .bottom)
+                barView(geo.size)
             }
         }
         .ignoresSafeArea()
@@ -4631,15 +4647,53 @@ struct ScreenLayoutEditor: View {
         }
     }
 
-    private var toolbar: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 10) {
+    // MARK: Bar
+
+    @ViewBuilder private func barView(_ size: CGSize) -> some View {
+        Group {
+            if mode != .none {
+                // Marking: only a hint, so the whole frame can be reached.
+                HStack(spacing: 10) {
+                    Text(mode == .anchor ? "Drag over something that is always on this screen, and only on it"
+                                         : "Drag over what you want larger").font(.caption)
+                    Button("Stop") { mode = .none; marking = nil }.controlSize(.small)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 6)
+                .background(.ultraThinMaterial, in: Capsule())
+                .allowsHitTesting(true)
+            } else if folded {
+                Button { folded = false } label: { Label("Layout", systemImage: "slider.horizontal.3") }
+                    .buttonStyle(.borderedProminent).controlSize(.small)
+            } else {
+                controlsBody(size)
+            }
+        }
+        .fixedSize()
+        .position(x: bar.x * size.width, y: bar.y * size.height)
+        .frame(width: size.width, height: size.height, alignment: .topLeading)
+    }
+
+    /// The grip that moves the bar (global: the bar moves under the finger).
+    private func grip(_ size: CGSize) -> some View {
+        Image(systemName: "line.3.horizontal").font(.title3).padding(6).contentShape(Rectangle())
+            .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global).onChanged { g in
+                let from = barFrom ?? bar
+                barFrom = from
+                bar = CGPoint(x: min(max(from.x + g.translation.width / max(size.width, 1), 0.1), 0.9),
+                              y: min(max(from.y + g.translation.height / max(size.height, 1), 0.06), 0.94))
+            }.onEnded { _ in barFrom = nil })
+    }
+
+    private func controlsBody(_ size: CGSize) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                grip(size)
                 Button("Cancel") {
                     // The editor previews its anchors in the game; put the saved screens back.
                     ScreenLayouts.apply(model.layoutHidden ? nil : model.activeEntry?.layouts)
                     model.layoutEditing = false
                 }
-                Spacer()
+                Divider().frame(height: 18)
                 Text("Screen").font(.caption)
                 ForEach(layouts.indices, id: \.self) { i in
                     Button { show(screen: i) } label: {
@@ -4651,73 +4705,88 @@ struct ScreenLayoutEditor: View {
                     Button("New screen", systemImage: "plus") { layouts.append(ScreenLayout()); show(screen: layouts.count - 1) }
                         .labelStyle(.iconOnly)
                 }
-                Button(toolbarAtTop ? "Move bar down" : "Move bar up", systemImage: toolbarAtTop ? "arrow.down.to.line" : "arrow.up.to.line") { toolbarAtTop.toggle() }
-                    .labelStyle(.iconOnly)
-                Spacer()
+                Spacer(minLength: 8)
+                Button("Fold the bar", systemImage: "chevron.down.circle") { folded = true }.labelStyle(.iconOnly)
                 Button("Save") {
                     model.saveScreenLayouts(layouts.filter { !$0.zones.isEmpty || $0.anchored })
                     model.layoutEditing = false
                 }.buttonStyle(.borderedProminent)
             }
-            if mode != .none {
-                HStack(spacing: 10) {
-                    Text(mode == .anchor ? "Drag over something that is always on this screen, and only on it"
-                                         : "Drag over what you want larger").font(.caption)
-                    Button("Stop") { mode = .none; marking = nil }
+            HStack(spacing: 10) {
+                Button("Add zone", systemImage: "plus.rectangle.on.rectangle") { mode = .zone; selected = nil }
+                    .disabled(image == nil || zones.count >= 16)
+                if layouts.indices.contains(screen), layouts[screen].anchored {
+                    Button("Change anchor", systemImage: "scope") { mode = .anchor; selected = nil }.disabled(image == nil)
+                    Button("No anchor", systemImage: "xmark") { setAnchor(nil) }
+                    // The hook reads this screen's anchor from the running game about 10 times a second.
+                    TimelineView(.periodic(from: .now, by: 0.5)) { _ in
+                        let score = madeira_remap_layout_score(Int32(screen))
+                        Text(score < 0 ? "Match: –" : String(format: "Match: %.2f %@", score, score >= 0.45 ? "✓" : "✗"))
+                            .font(.caption.monospacedDigit())
+                    }
+                } else {
+                    Button("Set anchor", systemImage: "scope") { mode = .anchor; selected = nil }.disabled(image == nil)
+                    Text(layouts.count > 1 ? "No anchor: shown when no other screen matches" : "No anchor: always shown")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
-            } else {
-                HStack(spacing: 10) {
-                    Button("Add zone", systemImage: "plus.rectangle.on.rectangle") { mode = .zone; selected = nil }
-                        .disabled(image == nil || zones.count >= 16)
-                    if layouts.indices.contains(screen), layouts[screen].anchored {
-                        Button("Change anchor", systemImage: "scope") { mode = .anchor; selected = nil }.disabled(image == nil)
-                        Button("No anchor", systemImage: "xmark") { setAnchor(nil) }
-                        // The hook reads this screen's anchor from the running game about 10 times a second.
-                        TimelineView(.periodic(from: .now, by: 0.5)) { _ in
-                            let score = madeira_remap_layout_score(Int32(screen))
-                            Text(score < 0 ? "Match: –" : String(format: "Match: %.2f %@", score, score >= 0.45 ? "✓" : "✗"))
-                                .font(.caption.monospacedDigit())
-                        }
-                    } else {
-                        Button("Set anchor", systemImage: "scope") { mode = .anchor; selected = nil }.disabled(image == nil)
-                        Text(layouts.count > 1 ? "No anchor: shown when no other screen matches" : "No anchor: always shown")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    if layouts.count > 1 {
-                        Button("Delete screen", systemImage: "trash", role: .destructive) { deleteScreen() }
-                    }
+                if layouts.count > 1 {
+                    Button("Delete screen", systemImage: "trash", role: .destructive) { deleteScreen() }
                 }
             }
-            if !zones.isEmpty && mode == .none {
+            if !zones.isEmpty {
                 HStack(spacing: 8) {
-                    Text(selected == nil ? "Tap a copy, or pick a zone, to change it:" : "Zone").font(.caption)
+                    Text(selected == nil ? "Tap an enlarged zone, or its number, to change it:" : "Zone").font(.caption)
                     ForEach(zones.indices, id: \.self) { i in
                         Button("\(i + 1)") { selected = i }
                             .buttonStyle(.bordered).tint(selected == i ? .yellow : .gray)
                     }
                 }
             }
-            if let i = selected, zones.indices.contains(i), mode == .none {
-                let scale = zones[i].destination.width / zones[i].source.width
-                HStack(spacing: 14) {
-                    Text("Size").font(.caption)
-                    // The bindings run after a Delete has removed the zone, so they check it is still there.
-                    Slider(value: Binding(get: { zones.indices.contains(i) ? zones[i].destination.width / zones[i].source.width : 1 },
-                                          set: { if zones.indices.contains(i) { resize(i, scale: $0) } }), in: 0.5...4)
-                        .frame(maxWidth: 220)
-                    Text(String(format: "%.1f×", scale)).font(.caption.monospacedDigit())
-                    Toggle("Hide original", isOn: Binding(get: { zones.indices.contains(i) && zones[i].hideSource == true },
-                                                          set: { if zones.indices.contains(i) { zones[i].hideSource = $0 ? true : nil } })).fixedSize()
-                    Button("Delete", systemImage: "trash", role: .destructive) {
-                        selected = nil
-                        if zones.indices.contains(i) { zones.remove(at: i) }
-                    }
-                }
+            if let i = selected, zones.indices.contains(i) { zoneControls(i) }
+        }
+        .font(.callout)
+        .controlSize(.small)
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(.ultraThinMaterial.opacity(0.92), in: RoundedRectangle(cornerRadius: 16))
+        .fixedSize()
+    }
+
+    // The bindings run after a Delete has removed the zone, so they check it is still there.
+    @ViewBuilder private func zoneControls(_ i: Int) -> some View {
+        let scale = zones[i].destination.width / zones[i].source.width
+        HStack(spacing: 8) {
+            Text("Size").font(.caption)
+            Button("Smaller", systemImage: "minus") { if zones.indices.contains(i) { resize(i, scale: scale - 0.1) } }
+                .labelStyle(.iconOnly)
+            Slider(value: Binding(get: { zones.indices.contains(i) ? zones[i].destination.width / zones[i].source.width : 1 },
+                                  set: { if zones.indices.contains(i) { resize(i, scale: $0) } }), in: Self.scales)
+                .frame(width: 160)
+            Button("Larger", systemImage: "plus") { if zones.indices.contains(i) { resize(i, scale: scale + 0.1) } }
+                .labelStyle(.iconOnly)
+            Text(String(format: "%.1f×", scale)).font(.caption.monospacedDigit())
+            Picker("Scaling", selection: Binding(get: { zones.indices.contains(i) && zones[i].sharp == true },
+                                                 set: { if zones.indices.contains(i) { zones[i].sharp = $0 ? true : nil } })) {
+                Text("Smooth").tag(false); Text("Sharp").tag(true)
+            }.pickerStyle(.segmented).frame(width: 130)
+        }
+        HStack(spacing: 8) {
+            Text("Original").font(.caption)
+            Picker("Original", selection: Binding(get: { zones.indices.contains(i) ? Self.original(zones[i]) : 0 },
+                                                  set: { if zones.indices.contains(i) { Self.setOriginal(&zones[i], $0) } })) {
+                Text("Show").tag(0); Text("Black").tag(1); Text("Blend").tag(2)
+            }.pickerStyle(.segmented).frame(width: 200)
+            Spacer(minLength: 8)
+            Button("Delete zone", systemImage: "trash", role: .destructive) {
+                selected = nil
+                if zones.indices.contains(i) { zones.remove(at: i) }
             }
         }
-        .padding(.horizontal, 16).padding(.vertical, 10)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
-        .padding(.horizontal, 60).padding(.vertical, 8)
+    }
+
+    private static func original(_ z: ScreenZone) -> Int { z.hideSource == true ? (z.blendSource == true ? 2 : 1) : 0 }
+    private static func setOriginal(_ z: inout ScreenZone, _ v: Int) {
+        z.hideSource = v > 0 ? true : nil
+        z.blendSource = v == 2 ? true : nil
     }
 
     private func show(screen i: Int) {
@@ -4754,6 +4823,8 @@ struct ScreenLayoutEditor: View {
         return CGRect(x: (size.width - w) / 2, y: (size.height - h) / 2, width: w, height: h)
     }
 
+    // MARK: Zones
+
     private func zoneView(_ i: Int, _ z: ScreenZone, image: CGImage, frame: CGRect) -> some View {
         let chosen = selected == i
         let src = CGRect(x: frame.minX + z.source.minX * frame.width, y: frame.minY + z.source.minY * frame.height,
@@ -4762,20 +4833,30 @@ struct ScreenLayoutEditor: View {
                          width: z.destination.width * frame.width, height: z.destination.height * frame.height)
         let pixels = CGRect(x: z.source.minX * CGFloat(image.width), y: z.source.minY * CGFloat(image.height),
                             width: z.source.width * CGFloat(image.width), height: z.source.height * CGFloat(image.height)).integral
+        let piece = image.cropping(to: pixels)
         return ZStack(alignment: .topLeading) {
-            if z.hideSource == true { Rectangle().fill(.black).frame(width: src.width, height: src.height).offset(x: src.minX, y: src.minY).allowsHitTesting(false) }
+            // The hidden original, as the game will show it.
+            if z.hideSource == true {
+                Group {
+                    if z.blendSource == true, let piece {
+                        Image(decorative: piece, scale: 1).resizable().blur(radius: 14, opaque: true)
+                    } else { Color.black }
+                }
+                .frame(width: src.width, height: src.height).clipped()
+                .offset(x: src.minX, y: src.minY).allowsHitTesting(false)
+            }
             Rectangle().stroke(chosen ? .yellow : .white.opacity(0.7), style: StrokeStyle(lineWidth: 1.5, dash: [5, 4]))
                 .frame(width: src.width, height: src.height).offset(x: src.minX, y: src.minY).allowsHitTesting(false)
             Group {
-                if let piece = image.cropping(to: pixels) {
-                    Image(decorative: piece, scale: 1).resizable().interpolation(.high)
+                if let piece {
+                    Image(decorative: piece, scale: 1).resizable().interpolation(z.sharp == true ? .none : .high)
                 } else { Color.gray }
             }
             .frame(width: dst.width, height: dst.height)
             .overlay(Rectangle().stroke(chosen ? .yellow : .white, lineWidth: chosen ? 3 : 1.5))
             .contentShape(Rectangle())
             .onTapGesture { selected = i; mode = .none }
-            // Global: the copy moves under the finger, so a local translation would feed back.
+            // Global: the zone moves under the finger, so a local translation would feed back.
             .gesture(DragGesture(minimumDistance: 2, coordinateSpace: .global).onChanged { g in
                 guard zones.indices.contains(i) else { return }
                 selected = i
@@ -4786,7 +4867,38 @@ struct ScreenLayoutEditor: View {
             }.onEnded { _ in moveFrom = nil })
             .offset(x: dst.minX, y: dst.minY)
             .allowsHitTesting(mode == .none)
+            if chosen && mode == .none {
+                // The enlarged zone's size, from its bottom-right corner.
+                handle(.yellow).position(x: dst.maxX, y: dst.maxY)
+                    .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global).onChanged { g in
+                        guard zones.indices.contains(i) else { return }
+                        let from = moveFrom ?? zones[i].destination
+                        moveFrom = from
+                        let w = (from.width + g.translation.width / frame.width) / zones[i].source.width
+                        setScale(i, w, keepingTopLeft: from.origin)
+                    }.onEnded { _ in moveFrom = nil })
+                // The marked part, from its four corners; the enlarged zone keeps its scale and centre.
+                ForEach(0..<4, id: \.self) { c in
+                    handle(.white).position(x: c % 2 == 0 ? src.minX : src.maxX, y: c < 2 ? src.minY : src.maxY)
+                        .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global).onChanged { g in
+                            guard zones.indices.contains(i) else { return }
+                            let from = moveFrom ?? zones[i].source
+                            moveFrom = from
+                            let dx = g.translation.width / frame.width, dy = g.translation.height / frame.height
+                            var x0 = from.minX, y0 = from.minY, x1 = from.maxX, y1 = from.maxY
+                            if c % 2 == 0 { x0 = min(max(x0 + dx, 0), x1 - 0.01) } else { x1 = max(min(x1 + dx, 1), x0 + 0.01) }
+                            if c < 2 { y0 = min(max(y0 + dy, 0), y1 - 0.01) } else { y1 = max(min(y1 + dy, 1), y0 + 0.01) }
+                            setSource(i, CGRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0))
+                        }.onEnded { _ in moveFrom = nil })
+                }
+            }
         }
+    }
+
+    private func handle(_ color: Color) -> some View {
+        Circle().fill(color).frame(width: 14, height: 14)
+            .overlay(Circle().stroke(.black.opacity(0.6), lineWidth: 1))
+            .padding(10).contentShape(Rectangle())   // a larger target than it looks
     }
 
     private func markGesture(_ frame: CGRect, image: CGImage) -> some Gesture {
@@ -4799,17 +4911,32 @@ struct ScreenLayoutEditor: View {
             defer { marking = nil; mode = .none }
             guard let m = marking, m.width > 0.01, m.height > 0.01 else { return }
             if mode == .anchor { setAnchor(m); return }
-            // The copy starts twice as large, in the middle of the screen.
+            // The enlarged zone starts twice as large, in the middle of the screen.
             let copy = ScreenLayouts.inside(CGRect(x: 0.5 - m.width, y: 0.5 - m.height, width: m.width * 2, height: m.height * 2))
             zones.append(ScreenZone(source: m, destination: copy))
             selected = zones.count - 1
         }
     }
 
+    /// The enlarged zone at `scale` times its source, around its centre.
     private func resize(_ i: Int, scale: Double) {
-        let s = zones[i].source, d = zones[i].destination
-        zones[i].destination = ScreenLayouts.inside(CGRect(x: d.midX - s.width * scale / 2, y: d.midY - s.height * scale / 2,
-                                                           width: s.width * scale, height: s.height * scale))
+        let d = zones[i].destination
+        setScale(i, scale, keepingTopLeft: nil, centre: CGPoint(x: d.midX, y: d.midY))
+    }
+
+    private func setScale(_ i: Int, _ scale: Double, keepingTopLeft origin: CGPoint?, centre: CGPoint? = nil) {
+        let s = zones[i].source, k = min(max(scale, Self.scales.lowerBound), Self.scales.upperBound)
+        let w = s.width * k, h = s.height * k
+        let r = origin.map { CGRect(x: $0.x, y: $0.y, width: w, height: h) }
+            ?? CGRect(x: (centre?.x ?? 0.5) - w / 2, y: (centre?.y ?? 0.5) - h / 2, width: w, height: h)
+        zones[i].destination = ScreenLayouts.inside(r)
+    }
+
+    /// A new marked part; the enlarged zone keeps its scale and centre.
+    private func setSource(_ i: Int, _ r: CGRect) {
+        let old = zones[i], k = old.destination.width / old.source.width
+        zones[i].source = r
+        setScale(i, k, keepingTopLeft: nil, centre: CGPoint(x: old.destination.midX, y: old.destination.midY))
     }
 
     private func capture() {

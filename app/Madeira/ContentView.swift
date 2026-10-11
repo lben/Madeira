@@ -210,7 +210,7 @@ final class MetalBackedView: UIView {
     private func applyDisplayMode(reason: String) {
         guard let w = window else { return }
         let r = gameRect()
-        MetalHostView.shared.frame = convert(r, to: w)
+        MetalHostView.shared.frame = ScreenZoom.unzoom(convert(r, to: w))
         // The desktop compositor lays the guest display out in the same rect,
         // so Aspect / Fill / Stretch / Fit apply to desktop sessions as well.
         winios_set_desktop_rect(r.minX - bounds.minX, r.minY - bounds.minY, r.width, r.height, 1)
@@ -273,7 +273,7 @@ final class MetalBackedView: UIView {
         // S2 desktop mode: the winios compositor renders the wine virtual
         // desktop aspect-fit inside THIS placeholder's area, exactly like
         // the games' Metal layer — never over the whole phone screen.
-        let full = convert(bounds, to: w)
+        let full = ScreenZoom.unzoom(convert(bounds, to: w))
         winios_set_compositor_frame(full.minX, full.minY, full.width, full.height)
         if !Self.layerRegistered {
             Self.layerRegistered = true
@@ -291,7 +291,7 @@ final class MetalBackedView: UIView {
         super.layoutSubviews()
         if let w = window {
             applyDisplayMode(reason: "layout")
-            let full = convert(bounds, to: w)
+            let full = ScreenZoom.unzoom(convert(bounds, to: w))
             winios_set_compositor_frame(full.minX, full.minY, full.width, full.height)
         }
     }
@@ -309,7 +309,9 @@ final class MetalBackedView: UIView {
     /// its own frame, so it does the mapping.
     private func mapPoint(_ p: CGPoint) -> (Int32, Int32) {
         if desktopMode {
-            let w = convert(p, to: nil)
+            // convert(to:) includes the zoom (the window layer's sublayerTransform); the
+            // compositor's geometry does not.
+            let w = ScreenZoom.unzoom(convert(p, to: nil))
             var px: Int32 = 0, py: Int32 = 0
             _ = winios_desktop_point_from_window(Double(w.x), Double(w.y), &px, &py)
             Self.cursor = CGPoint(x: CGFloat(px), y: CGFloat(py))   // keep the trackpad cursor in step
@@ -580,12 +582,70 @@ final class MetalBackedView: UIView {
         return rest.isEmpty ? nil : rest
     }
 
+    // MARK: Pinch to zoom (ScreenZoom), in library sessions, in every pointer mode
+
+    private var zoomStart: (distance: CGFloat, scale: CGFloat, content: CGPoint)?
+    private var zooming = false
+
+    /// Two fingers moving apart or together zoom and pan the game view; true while a zoom
+    /// gesture owns the touches (until every finger has lifted).
+    private func zoomMoved(_ event: UIEvent?) -> Bool {
+        guard LibraryModel.shared.current != nil, let w = window else { return false }
+        let active = activeTouches(event)
+        guard active.count == 2 else { return zooming }
+        // Raw window points: a touch's location in a view already has the zoom taken out.
+        let a = active[0].location(in: nil), b = active[1].location(in: nil)
+        let d = hypot(a.x - b.x, a.y - b.y), mid = CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
+        guard let start = zoomStart else { zoomStart = (d, ScreenZoom.scale, ScreenZoom.unzoom(mid)); return zooming }
+        if !zooming {
+            guard start.distance > 20, abs(d / start.distance - 1) > 0.15 else { return false }
+            zooming = true
+            zoomBegan()
+        }
+        let k = start.scale * d / start.distance
+        // The game point that was under the fingers stays under them.
+        ScreenZoom.set(scale: k, offset: CGPoint(x: mid.x - k * start.content.x, y: mid.y - k * start.content.y), in: w)
+        return true
+    }
+
+    /// A zoom takes over the gesture: whatever the fingers had started in the game ends here.
+    private func zoomBegan() {
+        if touchPointerMode {
+            if tmResolved, let d = tmDragTouch { let (x, y) = mapPoint(d.location(in: self)); winios_post_touch_up(x, y) }
+            tmResetGesture(); tmSlopBroken = true; tmResolved = true   // nothing more until every finger lifts
+        } else if desktopMode {
+            if dragActive { postPointer(F_LUP); dragActive = false; dragTouch = nil }
+            twoFingerMoved = true   // no right click
+        } else if let p = directTouchPoint {
+            let (x, y) = mapPoint(p); winios_post_touch_up(x, y)
+        }
+        fputs("[zoom] pinch began\n", stderr)
+    }
+
+    /// Touches ending or starting: a zoom ends when every finger has lifted.
+    private func zoomTouchesChanged(_ event: UIEvent?) -> Bool {
+        let left = activeTouches(event).count
+        if left != 2 { zoomStart = nil }
+        guard zooming else { return false }
+        if left == 0 {
+            zooming = false
+            if ScreenZoom.scale < 1.1, let w = window { ScreenZoom.set(scale: 1, offset: .zero, in: w) }
+            if touchPointerMode { tmResetGesture() } else if desktopMode { twoFingerActive = false }
+            fputs("[zoom] \(String(format: "%.2f", ScreenZoom.scale))x\n", stderr)
+        }
+        return true
+    }
+    /// Direct sessions (no pointer mode): where the first finger is, for a zoom to release it.
+    private var directTouchPoint: CGPoint?
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         if HardwareInput.shared.interceptTouches(touches, event, .began) { return }
         guard let touches = tmgFilter(touches, .began) else { return }
+        if zoomTouchesChanged(event) { return }
         if touchPointerMode { touchModeBegan(touches); return }
         guard desktopMode else {
-            guard let t = touches.first else { return }
+            guard let t = touches.first, directTouchPoint == nil else { return }
+            directTouchPoint = t.location(in: self)
             let (x, y) = mapTouch(t)
             winios_post_touch_down(x, y)
             return
@@ -630,9 +690,11 @@ final class MetalBackedView: UIView {
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         if HardwareInput.shared.interceptTouches(touches, event, .moved) { return }
         guard let touches = tmgFilter(touches, .moved) else { return }
+        if zoomMoved(event) { return }
         if touchPointerMode { touchModeMoved(touches, event); return }
         guard desktopMode else {
-            guard let t = touches.first else { return }
+            guard let t = touches.first, directTouchPoint != nil else { return }
+            directTouchPoint = t.location(in: self)
             let (x, y) = mapTouch(t)
             winios_post_touch_move(x, y)
             return
@@ -712,9 +774,11 @@ final class MetalBackedView: UIView {
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         if HardwareInput.shared.interceptTouches(touches, event, .ended) { return }
         guard let touches = tmgFilter(touches, .ended) else { return }
+        if zoomTouchesChanged(event) { if activeTouches(event).isEmpty { directTouchPoint = nil }; return }
         if touchPointerMode { touchModeEnded(touches, event); return }
         guard desktopMode else {
-            guard let t = touches.first else { return }
+            guard let t = touches.first, directTouchPoint != nil else { return }
+            if activeTouches(event).isEmpty { directTouchPoint = nil }
             let (x, y) = mapTouch(t)
             winios_post_touch_up(x, y)
             return
@@ -756,9 +820,11 @@ final class MetalBackedView: UIView {
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         if HardwareInput.shared.interceptTouches(touches, event, .cancelled) { return }
         guard let touches = tmgFilter(touches, .cancelled) else { return }
+        if zoomTouchesChanged(event) { if activeTouches(event).isEmpty { directTouchPoint = nil }; return }
         if touchPointerMode { touchModeCancelled(touches); return }
         guard desktopMode else {
-            guard let t = touches.first else { return }
+            guard let t = touches.first, directTouchPoint != nil else { return }
+            if activeTouches(event).isEmpty { directTouchPoint = nil }
             let (x, y) = mapTouch(t)
             winios_post_touch_up(x, y)
             return
@@ -768,6 +834,49 @@ final class MetalBackedView: UIView {
         if dragActive { postPointer(F_LUP); dragActive = false }
         dragTouch = nil
         twoFingerActive = false
+    }
+}
+
+/// Pinch to zoom in a game session (MetalBackedView): the whole game view, scaled and
+/// panned like Photos, as one transform on the main window's sublayers (the game's layer,
+/// the Dock compositor, the drawn arrow). UIKit takes it out of a touch's location in a
+/// view by itself; window-space geometry handed to the game's views and the compositor
+/// goes through `unzoom`. The touch controls and the session menu are in their own window
+/// and stay put. Reset when a session begins or ends, by pinching back near 1x, and from
+/// the session menu.
+enum ScreenZoom {
+    private(set) static var scale: CGFloat = 1
+    /// shown = scale * point + offset, in window points.
+    private(set) static var offset = CGPoint.zero
+    private static weak var window: UIWindow?
+    static var zoomed: Bool { scale > 1.001 }
+
+    static func set(scale s: CGFloat, offset t: CGPoint, in w: UIWindow) {
+        let size = w.bounds.size, k = min(max(s, 1), 4)
+        // The game always covers the screen: no panning past its edges.
+        scale = k
+        offset = k > 1.001 ? CGPoint(x: min(max(t.x, size.width - k * size.width), 0),
+                                     y: min(max(t.y, size.height - k * size.height), 0)) : .zero
+        if k <= 1.001 { scale = 1 }
+        window = w
+        // sublayerTransform scales around the layer's centre (checked with CALayer.convert).
+        let c = CGPoint(x: w.bounds.midX, y: w.bounds.midY)
+        let m = CGAffineTransform(a: scale, b: 0, c: 0, d: scale,
+                                  tx: offset.x + (scale - 1) * c.x, ty: offset.y + (scale - 1) * c.y)
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        w.layer.sublayerTransform = scale == 1 ? CATransform3DIdentity : CATransform3DMakeAffineTransform(m)
+        CATransaction.commit()
+    }
+    static func reset() {
+        guard let w = window, zoomed else { return }
+        set(scale: 1, offset: .zero, in: w)
+        MetalBackedView.refreshDisplayMode(reason: "zoom-reset")
+    }
+    /// A window point as shown → the window point of what it shows.
+    static func unzoom(_ p: CGPoint) -> CGPoint { CGPoint(x: (p.x - offset.x) / scale, y: (p.y - offset.y) / scale) }
+    static func unzoom(_ r: CGRect) -> CGRect {
+        let o = unzoom(r.origin)
+        return CGRect(x: o.x, y: o.y, width: r.width / scale, height: r.height / scale)
     }
 }
 

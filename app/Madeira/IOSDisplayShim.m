@@ -281,8 +281,9 @@ void macdrv_view_release_metal_view(macdrv_metal_view v) {
 //
 // A game has up to 8 layouts, one per screen of the game. A layout is a list of
 // zones in the frame's normalised coordinates (0..1, origin top-left): each copies
-// its source rect to its destination rect (Lanczos-3), and may black out the
-// source. All sources are copied out first, so zones read the frame as the game
+// its source rect to its destination rect, smooth (Lanczos-3) or sharp (square
+// pixels with anti-aliased edges, for pixel art), and may hide the source, black or
+// blended from the pixels around it (a Coons patch of its border). All sources are copied out first, so zones read the frame as the game
 // drew it. A layout may have an anchor, a rect of the frame with the 48x12 luma
 // signature it had when the player chose it: every 6th frame the anchors are read
 // again on the GPU, and the layout whose anchor matches best (edge NCC >= 0.45,
@@ -298,7 +299,7 @@ void macdrv_view_release_metal_view(macdrv_metal_view v) {
 static NSString *const kRemapMSL = @
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct Quad { float4 dst; float4 src; };\n"   // dst in NDC (x0,y0,x1,y1); src in source texels
+"struct Quad { float4 dst; float4 src; float4 p; };\n"   // dst in NDC (x0,y0,x1,y1); src in source texels; p per shader
 "struct VOut { float4 pos [[position]]; float2 uv; };\n"
 "vertex VOut remap_vs(uint vid [[vertex_id]], constant Quad &q [[buffer(0)]]) {\n"
 "  float2 c = float2(vid & 1, vid >> 1);\n"
@@ -319,6 +320,32 @@ static NSString *const kRemapMSL = @
 "  return float4(clamp(acc.rgb / wsum, 0.0, 1.0), 1);\n"
 "}\n"
 "fragment float4 remap_fill_fs(VOut in [[stage_in]]) { return float4(0, 0, 0, 1); }\n"
+// sharp: each source texel a square of p.xy destination pixels, its edges anti-aliased
+"fragment float4 remap_sharp_fs(VOut in [[stage_in]], texture2d<float> t [[texture(0)]], constant Quad &q [[buffer(0)]]) {\n"
+"  float2 p = in.uv - 0.5, i = floor(p), f = clamp((p - i - 0.5) * q.p.xy + 0.5, 0.0, 1.0);\n"
+"  float2 lo = q.src.xy, hi = q.src.zw - 1;\n"
+"  float4 a = t.read(uint2(clamp(i, lo, hi))), b = t.read(uint2(clamp(i + float2(1, 0), lo, hi)));\n"
+"  float4 c = t.read(uint2(clamp(i + float2(0, 1), lo, hi))), d = t.read(uint2(clamp(i + float2(1, 1), lo, hi)));\n"
+"  return float4(mix(mix(a, b, f.x), mix(c, d, f.x), f.y).rgb, 1);\n"
+"}\n"
+// blend: the hidden rect filled from its border (p = left, top, right, bottom texel of the ring),
+// each border averaged along itself first so lines and text crossing it do not streak
+"static float4 along(texture2d<float> t, float2 at, float2 step, int r, float2 lo, float2 hi) {\n"
+"  float4 s = 0; for (int k = -r; k <= r; k++) s += t.read(uint2(clamp(at + step * k, lo, hi))); return s / (2 * r + 1);\n"
+"}\n"
+"fragment float4 remap_blend_fs(VOut in [[stage_in]], texture2d<float> t [[texture(0)]], constant Quad &q [[buffer(0)]]) {\n"
+"  float2 lo = q.p.xy, hi = q.p.zw;\n"
+"  float2 p = clamp(floor(in.uv), lo, hi);\n"
+"  float2 w = (p - lo) / max(hi - lo, float2(1));\n"
+"  int r = int(clamp(min(hi.x - lo.x, hi.y - lo.y) / 4, 2.0, 16.0));\n"
+"  float4 top = along(t, float2(p.x, lo.y), float2(1, 0), r, lo, hi), bottom = along(t, float2(p.x, hi.y), float2(1, 0), r, lo, hi);\n"
+"  float4 left = along(t, float2(lo.x, p.y), float2(0, 1), r, lo, hi), right = along(t, float2(hi.x, p.y), float2(0, 1), r, lo, hi);\n"
+"  float4 c00 = along(t, lo, float2(1, 0), r, lo, hi), c10 = along(t, float2(hi.x, lo.y), float2(1, 0), r, lo, hi);\n"
+"  float4 c01 = along(t, float2(lo.x, hi.y), float2(1, 0), r, lo, hi), c11 = along(t, hi, float2(1, 0), r, lo, hi);\n"
+"  float4 edges = mix(top, bottom, w.y) + mix(left, right, w.x);\n"
+"  float4 corners = mix(mix(c00, c10, w.x), mix(c01, c11, w.x), w.y);\n"
+"  return float4(clamp((edges - corners).rgb, 0.0, 1.0), 1);\n"
+"}\n"
 // one 48x12 box-averaged luma signature per anchor (pixel rects), z = anchor
 "kernel void remap_signature(texture2d<float> t [[texture(0)]], device float *out [[buffer(0)]],\n"
 "                            constant float4 *rects [[buffer(1)]], uint3 g [[thread_position_in_grid]]) {\n"
@@ -333,7 +360,8 @@ static NSString *const kRemapMSL = @
 "  out[g.z * 576 + g.y * 48 + g.x] = s / max(n, 1);\n"
 "}\n";
 
-typedef struct { float sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, hide; } MadeiraRemapZone;
+// hide: 0 no, 1 black, 2 blended; sharp: 1 square pixels, 0 Lanczos
+typedef struct { float sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, hide, sharp; } MadeiraRemapZone;
 typedef struct {
     int first, count;                     // its zones in g_remap.zones
     int anchored;
@@ -383,7 +411,7 @@ void madeira_remap_set_layouts(int layoutCount, const int *zoneCounts, const flo
         L->first = z; L->count = 0; L->score = -1;
         for (int i = 0; i < zoneCounts[l]; i++, read++) {
             MadeiraRemapZone c;
-            memcpy(&c, zones + read * 9, sizeof c);
+            memcpy(&c, zones + read * 10, sizeof c);
             if (L->count >= MADEIRA_REMAP_MAX_ZONES || !madeira_remap_rect_ok(c.sx0, c.sy0, c.sx1, c.sy1) ||
                 !madeira_remap_rect_ok(c.dx0, c.dy0, c.dx1, c.dy1)) continue;
             g_remap.zones[z++] = c; L->count++;
@@ -502,9 +530,9 @@ static id<MTLRenderPipelineState> madeira_remap_pipeline(NSString *fs, MTLPixelF
 // One quad: destination in pixels of a W x H target, source in texels of the bound texture.
 static void madeira_remap_quad(id<MTLRenderCommandEncoder> enc, double W, double H,
                                double dx0, double dy0, double dx1, double dy1,
-                               double sx0, double sy0, double sx1, double sy1) {
-    float q[8] = { (float)(dx0 / W * 2 - 1), (float)(1 - dy0 / H * 2), (float)(dx1 / W * 2 - 1), (float)(1 - dy1 / H * 2),
-                   (float)sx0, (float)sy0, (float)sx1, (float)sy1 };
+                               double sx0, double sy0, double sx1, double sy1, const float p[4]) {
+    float q[12] = { (float)(dx0 / W * 2 - 1), (float)(1 - dy0 / H * 2), (float)(dx1 / W * 2 - 1), (float)(1 - dy1 / H * 2),
+                    (float)sx0, (float)sy0, (float)sx1, (float)sy1, p ? p[0] : 0, p ? p[1] : 0, p ? p[2] : 0, p ? p[3] : 0 };
     [enc setVertexBytes:q length:sizeof q atIndex:0];
     [enc setFragmentBytes:q length:sizeof q atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
@@ -526,7 +554,7 @@ static void madeira_remap_encode_capture(id<MTLCommandBuffer> cb, id<MTLTexture>
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
     [enc setRenderPipelineState:pso];
     [enc setFragmentTexture:tex atIndex:0];
-    madeira_remap_quad(enc, W, H, 0, 0, W, H, 0, 0, W, H);   // 1:1, so Lanczos copies texels exactly
+    madeira_remap_quad(enc, W, H, 0, 0, W, H, 0, 0, W, H, NULL);   // 1:1, so Lanczos copies texels exactly
     [enc endEncoding];
     id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
     [blit copyFromTexture:target sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(W, H, 1)
@@ -590,6 +618,7 @@ void madeira_present_remap(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable
     int first = active >= 0 ? g_remap.layouts[active].first : 0;
     int n = active >= 0 ? g_remap.layouts[active].count : 0;
     NSUInteger sx[MADEIRA_REMAP_MAX_ZONES], sy[MADEIRA_REMAP_MAX_ZONES], sw[MADEIRA_REMAP_MAX_ZONES], sh[MADEIRA_REMAP_MAX_ZONES];
+    NSUInteger ex[MADEIRA_REMAP_MAX_ZONES], ey[MADEIRA_REMAP_MAX_ZONES], ew[MADEIRA_REMAP_MAX_ZONES], eh[MADEIRA_REMAP_MAX_ZONES];
     NSUInteger packW = 0, packH = 0;
     for (int i = 0; i < n; i++) {
         MadeiraRemapZone z = g_remap.zones[first + i];
@@ -597,11 +626,16 @@ void madeira_present_remap(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable
         sx[i] = (NSUInteger)MIN(lround(z.sx0 * W), (long)W - 1); sy[i] = (NSUInteger)MIN(lround(z.sy0 * H), (long)H - 1);
         sw[i] = (NSUInteger)MAX(MIN(lround(z.sx1 * W), (long)W) - (long)sx[i], 1);
         sh[i] = (NSUInteger)MAX(MIN(lround(z.sy1 * H), (long)H) - (long)sy[i], 1);
-        packW += sw[i]; packH = MAX(packH, sh[i]);
+        // copied with the pixels around it (the blend's border), inside the frame
+        ex[i] = sx[i] > 0 ? sx[i] - 1 : 0; ey[i] = sy[i] > 0 ? sy[i] - 1 : 0;
+        ew[i] = MIN(sx[i] + sw[i] + 1, (NSUInteger)W) - ex[i]; eh[i] = MIN(sy[i] + sh[i] + 1, (NSUInteger)H) - ey[i];
+        packW += ew[i]; packH = MAX(packH, eh[i]);
     }
     id<MTLRenderPipelineState> draw = n ? madeira_remap_pipeline(@"remap_fs", tex.pixelFormat) : nil;
+    id<MTLRenderPipelineState> sharp = n ? madeira_remap_pipeline(@"remap_sharp_fs", tex.pixelFormat) : nil;
     id<MTLRenderPipelineState> fill = n ? madeira_remap_pipeline(@"remap_fill_fs", tex.pixelFormat) : nil;
-    if (n && draw && fill && packW && packH) {
+    id<MTLRenderPipelineState> blend = n ? madeira_remap_pipeline(@"remap_blend_fs", tex.pixelFormat) : nil;
+    if (n && draw && sharp && fill && blend && packW && packH) {
         // the sources side by side in one scratch texture, copied before anything is drawn
         if (!g_remap.scratch || g_remap.scratch.width < packW || g_remap.scratch.height < packH || g_remap.scratch.pixelFormat != tex.pixelFormat) {
             MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:tex.pixelFormat
@@ -614,10 +648,10 @@ void madeira_present_remap(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable
         NSUInteger at[MADEIRA_REMAP_MAX_ZONES], x = 0;
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
         for (int i = 0; i < n; i++) {
-            [blit copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(sx[i], sy[i], 0)
-                       sourceSize:MTLSizeMake(sw[i], sh[i], 1) toTexture:scratch destinationSlice:0
+            [blit copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(ex[i], ey[i], 0)
+                       sourceSize:MTLSizeMake(ew[i], eh[i], 1) toTexture:scratch destinationSlice:0
                  destinationLevel:0 destinationOrigin:MTLOriginMake(x, 0, 0)];
-            at[i] = x; x += sw[i];
+            at[i] = x; x += ew[i];
         }
         [blit endEncoding];
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -625,14 +659,24 @@ void madeira_present_remap(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable
         rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
-        [enc setRenderPipelineState:fill];
-        for (int i = 0; i < n; i++)
-            if (g_remap.zones[first + i].hide) madeira_remap_quad(enc, W, H, sx[i], sy[i], sx[i] + sw[i], sy[i] + sh[i], 0, 0, 1, 1);
-        [enc setRenderPipelineState:draw];
         [enc setFragmentTexture:scratch atIndex:0];
         for (int i = 0; i < n; i++) {
+            float hide = g_remap.zones[first + i].hide;
+            if (hide <= 0) continue;
+            // the source inside the scratch copy, and the ring of pixels around it
+            double ix = at[i] + (sx[i] - ex[i]), iy = sy[i] - ey[i];
+            float ring[4] = { (float)(sx[i] > ex[i] ? ix - 1 : ix), (float)(sy[i] > ey[i] ? iy - 1 : iy),
+                              (float)(ex[i] + ew[i] > sx[i] + sw[i] ? ix + sw[i] : ix + sw[i] - 1),
+                              (float)(ey[i] + eh[i] > sy[i] + sh[i] ? iy + sh[i] : iy + sh[i] - 1) };
+            [enc setRenderPipelineState:hide >= 2 ? blend : fill];
+            madeira_remap_quad(enc, W, H, sx[i], sy[i], sx[i] + sw[i], sy[i] + sh[i], ix, iy, ix + sw[i], iy + sh[i], ring);
+        }
+        for (int i = 0; i < n; i++) {
             MadeiraRemapZone z = g_remap.zones[first + i];
-            madeira_remap_quad(enc, W, H, z.dx0 * W, z.dy0 * H, z.dx1 * W, z.dy1 * H, at[i], 0, at[i] + sw[i], sh[i]);
+            double ix = at[i] + (sx[i] - ex[i]), iy = sy[i] - ey[i];
+            float scale[4] = { (float)((z.dx1 - z.dx0) * W / sw[i]), (float)((z.dy1 - z.dy0) * H / sh[i]), 0, 0 };
+            [enc setRenderPipelineState:z.sharp > 0 ? sharp : draw];
+            madeira_remap_quad(enc, W, H, z.dx0 * W, z.dy0 * H, z.dx1 * W, z.dy1 * H, ix, iy, ix + sw[i], iy + sh[i], scale);
         }
         [enc endEncoding];
     }
