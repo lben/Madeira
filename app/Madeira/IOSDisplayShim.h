@@ -20,10 +20,20 @@ void madeira_display_set_layer(CAMetalLayer *layer);
 extern NSString * const MadeiraDisplayModeChangedNotification;
 
 // Screen layouts (the last step on a game frame, see IOSDisplayShim.m).
-// `zones`: `count` zones of 9 floats each, in the frame's normalised coordinates
-// (origin top-left): source x0 y0 x1 y1, destination x0 y0 x1 y1, hide (1 = black
-// out the source). count 0 clears the layout.
-void madeira_remap_set_zones(const float *zones, int count);
+// `layoutCount` layouts (at most 8; 0 clears them). Layout l has zoneCounts[l]
+// zones, taken in order from `zones`, 9 floats each in the frame's normalised
+// coordinates (origin top-left): source x0 y0 x1 y1, destination x0 y0 x1 y1, hide
+// (1 = black out the source). anchors[l*4..]: its anchor rect, x0 y0 x1 y1, or -1s
+// for none; signatures[l*576..]: the anchor's 48x12 luma reference (row-major,
+// 0..1, box averages as the hook's remap_signature kernel computes them).
+void madeira_remap_set_layouts(int layoutCount, const int *zoneCounts, const float *zones,
+                               const float *anchors, const float *signatures);
+// The layout being drawn (-1: none), and the last match of a layout's anchor (-1 if
+// none yet); 1 is a perfect match, 0.45 the least that selects it.
+int madeira_remap_active_layout(void);
+float madeira_remap_layout_score(int layout);
+// Edge NCC of two 48x12 signatures (1 = the same picture).
+float madeira_remap_signature_match(const float *a, const float *b);
 // The next game frame as the game drew it (before any zone), on the main queue;
 // NULL when it could not be read or a newer request replaced this one.
 typedef void (^MadeiraFrameCapture)(CGImageRef image);

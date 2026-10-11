@@ -532,8 +532,12 @@ final class MetalBackedView: UIView {
         // Trackpad over a screen layout's copy: the game gets the spot the copy shows, and
         // the drawn arrow stays on the copy (it moves only with what is posted here).
         let p = InputSettings.shared.relative ? Self.cursor : Self.layoutPoint(Self.cursor)
+        let mapped = p != Self.cursor
+        // A click lands where the game's cursor is: put it on the mapped spot first when no
+        // move did (a tap with the arrow already resting on a copy).
+        if mapped && flags & F_MOVE == 0 { winios_pointer(Int32(p.x), Int32(p.y), F_MOVE | F_ABS, 0) }
         winios_pointer(Int32(p.x), Int32(p.y), flags, UInt32(bitPattern: data))
-        if p != Self.cursor && flags & F_MOVE != 0 && flags & F_ABS != 0 { winios_cursor_move(Int32(Self.cursor.x), Int32(Self.cursor.y)) }
+        if mapped { winios_cursor_move(Int32(Self.cursor.x), Int32(Self.cursor.y)) }
     }
     /// Screen layouts, Dock desktop: a desktop-pixel point on a copy, mapped to the spot it shows.
     static func layoutPoint(_ p: CGPoint) -> CGPoint {

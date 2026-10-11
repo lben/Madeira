@@ -279,13 +279,21 @@ void macdrv_view_release_metal_view(macdrv_metal_view v) {
 // encode thread, before it presents it. Work encoded here lands in the game's own
 // command buffer, after the frame and before the present.
 //
-// A layout is a list of zones in the frame's normalised coordinates (0..1, origin
-// top-left): each copies its source rect to its destination rect (Lanczos-3), and
-// may black out the source. All sources are copied out first, so zones read the
-// frame as the game drew it. The front end sets the zones of the running game
+// A game has up to 8 layouts, one per screen of the game. A layout is a list of
+// zones in the frame's normalised coordinates (0..1, origin top-left): each copies
+// its source rect to its destination rect (Lanczos-3), and may black out the
+// source. All sources are copied out first, so zones read the frame as the game
+// drew it. A layout may have an anchor, a rect of the frame with the 48x12 luma
+// signature it had when the player chose it: every 6th frame the anchors are read
+// again on the GPU, and the layout whose anchor matches best (edge NCC >= 0.45,
+// the same winner twice in a row) is drawn; when none matches, the first layout
+// without an anchor, if any. The front end sets the running game's layouts
 // (ScreenLayouts in Library.swift) and asks for one frame for its editor.
 
 #define MADEIRA_REMAP_MAX_ZONES 16
+#define MADEIRA_REMAP_MAX_LAYOUTS 8
+#define MADEIRA_REMAP_SIG 576          /* 48 x 12 */
+#define MADEIRA_REMAP_MATCH 0.45f
 
 static NSString *const kRemapMSL = @
 "#include <metal_stdlib>\n"
@@ -310,44 +318,135 @@ static NSString *const kRemapMSL = @
 "  }\n"
 "  return float4(clamp(acc.rgb / wsum, 0.0, 1.0), 1);\n"
 "}\n"
-"fragment float4 remap_fill_fs(VOut in [[stage_in]]) { return float4(0, 0, 0, 1); }\n";
+"fragment float4 remap_fill_fs(VOut in [[stage_in]]) { return float4(0, 0, 0, 1); }\n"
+// one 48x12 box-averaged luma signature per anchor (pixel rects), z = anchor
+"kernel void remap_signature(texture2d<float> t [[texture(0)]], device float *out [[buffer(0)]],\n"
+"                            constant float4 *rects [[buffer(1)]], uint3 g [[thread_position_in_grid]]) {\n"
+"  if (g.x >= 48 || g.y >= 12) return;\n"
+"  float4 r = rects[g.z];\n"
+"  float2 a = r.xy + (r.zw - r.xy) * float2(g.xy) / float2(48, 12);\n"
+"  float2 b = r.xy + (r.zw - r.xy) * float2(g.xy + 1) / float2(48, 12);\n"
+"  float s = 0; int n = 0;\n"
+"  for (int y = int(a.y); y < int(ceil(b.y)); y++) for (int x = int(a.x); x < int(ceil(b.x)); x++) {\n"
+"    s += dot(t.read(uint2(x, y)).rgb, float3(0.299, 0.587, 0.114)); n++; }\n"
+"  out[g.z * 576 + g.y * 48 + g.x] = s / max(n, 1);\n"
+"}\n";
 
 typedef struct { float sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, hide; } MadeiraRemapZone;
+typedef struct {
+    int first, count;                     // its zones in g_remap.zones
+    int anchored;
+    float anchor[4];                      // normalised x0 y0 x1 y1
+    float reference[MADEIRA_REMAP_SIG];
+    float score;                          // the last match, -1 before the first
+} MadeiraRemapLayout;
 
 static struct {
     pthread_mutex_t lock;
-    _Atomic int busy;   // zones set or a capture waiting: the hook does nothing without it
+    _Atomic int busy;   // layouts set or a capture waiting: the hook does nothing without it
     MadeiraRemapZone zones[MADEIRA_REMAP_MAX_ZONES];
-    int count;
+    int zoneCount;
+    MadeiraRemapLayout layouts[MADEIRA_REMAP_MAX_LAYOUTS];
+    int layoutCount, anchoredCount, fallback;   // fallback: the first layout without an anchor, or -1
+    _Atomic int active;                         // the layout drawn, or -1
+    int pending, pendingRuns;
+    uint64_t frames, generation;           // generation: bumped by every set_layouts
+    id<MTLBuffer> signatures[3];
+    unsigned signatureNext;
     MadeiraFrameCapture capture;
     id<MTLDevice> device;
     id<MTLLibrary> library;
     NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *pipelines;   // "fs/format"
     id<MTLTexture> scratch;
+    id<MTLComputePipelineState> signature;
     int failed;
 } g_remap = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
 static void madeira_remap_update_busy(void) {
-    g_remap.busy = g_remap.count > 0 || g_remap.capture != nil;
+    g_remap.busy = g_remap.layoutCount > 0 || g_remap.capture != nil;
 }
 
-void madeira_remap_set_zones(const float *zones, int count) {
-    if (count < 0 || !zones) count = 0;
-    if (count > MADEIRA_REMAP_MAX_ZONES) count = MADEIRA_REMAP_MAX_ZONES;
+static int madeira_remap_rect_ok(float x0, float y0, float x1, float y1) {
+    return x0 >= 0 && y0 >= 0 && x1 <= 1 && y1 <= 1 && x1 > x0 && y1 > y0;   // false for NaN too
+}
+
+void madeira_remap_set_layouts(int layoutCount, const int *zoneCounts, const float *zones,
+                               const float *anchors, const float *signatures) {
+    if (layoutCount < 0 || !zoneCounts || !anchors || !signatures) layoutCount = 0;
+    if (layoutCount > MADEIRA_REMAP_MAX_LAYOUTS) layoutCount = MADEIRA_REMAP_MAX_LAYOUTS;
     pthread_mutex_lock(&g_remap.lock);
-    int kept = 0;
-    for (int i = 0; i < count; i++) {
-        MadeiraRemapZone z;
-        memcpy(&z, zones + i * 9, sizeof z);
-        // normalised, non-empty, inside the frame
-        if (!(z.sx0 >= 0 && z.sy0 >= 0 && z.sx1 <= 1 && z.sy1 <= 1 && z.sx1 > z.sx0 && z.sy1 > z.sy0 &&
-              z.dx0 >= 0 && z.dy0 >= 0 && z.dx1 <= 1 && z.dy1 <= 1 && z.dx1 > z.dx0 && z.dy1 > z.dy0)) continue;
-        g_remap.zones[kept++] = z;
+    int z = 0, read = 0, anchored = 0;
+    g_remap.fallback = -1;
+    for (int l = 0; l < layoutCount; l++) {
+        MadeiraRemapLayout *L = &g_remap.layouts[l];
+        L->first = z; L->count = 0; L->score = -1;
+        for (int i = 0; i < zoneCounts[l]; i++, read++) {
+            MadeiraRemapZone c;
+            memcpy(&c, zones + read * 9, sizeof c);
+            if (z >= MADEIRA_REMAP_MAX_ZONES || !madeira_remap_rect_ok(c.sx0, c.sy0, c.sx1, c.sy1) ||
+                !madeira_remap_rect_ok(c.dx0, c.dy0, c.dx1, c.dy1)) continue;
+            g_remap.zones[z++] = c; L->count++;
+        }
+        const float *a = anchors + l * 4;
+        L->anchored = madeira_remap_rect_ok(a[0], a[1], a[2], a[3]);
+        if (L->anchored) {
+            memcpy(L->anchor, a, sizeof L->anchor);
+            memcpy(L->reference, signatures + l * MADEIRA_REMAP_SIG, sizeof L->reference);
+            anchored++;
+        } else if (g_remap.fallback < 0) g_remap.fallback = l;
     }
-    g_remap.count = kept;
+    g_remap.zoneCount = z;
+    g_remap.layoutCount = layoutCount;
+    g_remap.generation++;
+    g_remap.anchoredCount = anchored;
+    // Until the anchors are read, the layout without one.
+    g_remap.active = g_remap.fallback;
+    g_remap.pending = g_remap.fallback; g_remap.pendingRuns = 0;
     madeira_remap_update_busy();
     pthread_mutex_unlock(&g_remap.lock);
-    fprintf(stderr, "[screen-layout] %d zone(s) applied\n", kept);
+    fprintf(stderr, "[screen-layout] %d layout(s), %d with an anchor, %d zone(s) applied\n", layoutCount, anchored, z);
+}
+
+int madeira_remap_active_layout(void) { return g_remap.active; }
+
+float madeira_remap_layout_score(int layout) {
+    pthread_mutex_lock(&g_remap.lock);
+    float s = (layout >= 0 && layout < g_remap.layoutCount && g_remap.layouts[layout].anchored) ? g_remap.layouts[layout].score : -1;
+    pthread_mutex_unlock(&g_remap.lock);
+    return s;
+}
+
+// Normalised cross-correlation of the gradient magnitudes of two 48x12 signatures
+// (1 = the same picture; a flat signature, all one colour, matches nothing).
+float madeira_remap_signature_match(const float *a, const float *b) {
+    float ea[MADEIRA_REMAP_SIG], eb[MADEIRA_REMAP_SIG], ma = 0, mb = 0;
+    for (int y = 0; y < 12; y++) for (int x = 0; x < 48; x++) {
+        int i = y * 48 + x;
+        float ax = (x > 0 && x < 47) ? a[i + 1] - a[i - 1] : 0, ay = (y > 0 && y < 11) ? a[i + 48] - a[i - 48] : 0;
+        float bx = (x > 0 && x < 47) ? b[i + 1] - b[i - 1] : 0, by = (y > 0 && y < 11) ? b[i + 48] - b[i - 48] : 0;
+        ea[i] = sqrtf(ax * ax + ay * ay); eb[i] = sqrtf(bx * bx + by * by); ma += ea[i]; mb += eb[i];
+    }
+    ma /= MADEIRA_REMAP_SIG; mb /= MADEIRA_REMAP_SIG;
+    float num = 0, da = 0, db = 0;
+    for (int i = 0; i < MADEIRA_REMAP_SIG; i++) { float u = ea[i] - ma, v = eb[i] - mb; num += u * v; da += u * u; db += v * v; }
+    return (da < 1e-9f || db < 1e-9f) ? 0 : num / sqrtf(da * db);
+}
+
+// On a frame's completion: score each anchor, pick the screen. Called with the lock held.
+static void madeira_remap_choose(const float *live) {
+    int best = -1; float bestScore = MADEIRA_REMAP_MATCH;
+    for (int l = 0; l < g_remap.layoutCount; l++) {
+        MadeiraRemapLayout *L = &g_remap.layouts[l];
+        if (!L->anchored) continue;
+        L->score = madeira_remap_signature_match(L->reference, live + l * MADEIRA_REMAP_SIG);
+        if (L->score >= bestScore) { best = l; bestScore = L->score; }
+    }
+    int want = best >= 0 ? best : g_remap.fallback;
+    if (want == g_remap.pending) g_remap.pendingRuns++; else { g_remap.pending = want; g_remap.pendingRuns = 1; }
+    if (want != g_remap.active && g_remap.pendingRuns >= 2) {
+        fprintf(stderr, "[screen-layout] screen %d -> %d (match %.2f)\n", g_remap.active, want, best >= 0 ? bestScore : 0);
+        g_remap.active = want;
+    }
 }
 
 void madeira_remap_capture(MadeiraFrameCapture done) {
@@ -369,8 +468,18 @@ static BOOL madeira_remap_setup(id<MTLDevice> dev) {
         g_remap.failed = 1;
         return NO;
     }
-    g_remap.device = dev; g_remap.library = lib; g_remap.scratch = nil;
+    id<MTLFunction> sigFn = [lib newFunctionWithName:@"remap_signature"];
+    id<MTLComputePipelineState> sig = sigFn ? [dev newComputePipelineStateWithFunction:sigFn error:&err] : nil;
+    if (!sig) {
+        fprintf(stderr, "[screen-layout] signature kernel failed: %s\n", err.localizedDescription.UTF8String ?: "?");
+        g_remap.failed = 1;
+        return NO;
+    }
+    g_remap.device = dev; g_remap.library = lib; g_remap.scratch = nil; g_remap.signature = sig;
     g_remap.pipelines = [NSMutableDictionary new];
+    for (int i = 0; i < 3; i++)
+        g_remap.signatures[i] = [dev newBufferWithLength:MADEIRA_REMAP_MAX_LAYOUTS * MADEIRA_REMAP_SIG * sizeof(float)
+                                                 options:MTLResourceStorageModeShared];
     return YES;
 }
 
@@ -448,13 +557,41 @@ void madeira_present_remap(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable
     g_remap.capture = nil;
     madeira_remap_update_busy();
     if (capture) madeira_remap_encode_capture(cb, tex, capture);
-
-    int n = g_remap.count;
     double W = tex.width, H = tex.height;
+
+    // Every 6th frame the anchors, read from the frame as the game drew it.
+    if (g_remap.anchoredCount > 0 && g_remap.frames++ % 6 == 0) {
+        id<MTLBuffer> buf = g_remap.signatures[g_remap.signatureNext++ % 3];
+        float rects[MADEIRA_REMAP_MAX_LAYOUTS * 4];
+        for (int l = 0; l < g_remap.layoutCount; l++) {
+            const MadeiraRemapLayout *L = &g_remap.layouts[l];
+            float *r = rects + l * 4;
+            if (L->anchored) { r[0] = L->anchor[0] * W; r[1] = L->anchor[1] * H; r[2] = L->anchor[2] * W; r[3] = L->anchor[3] * H; }
+            else { r[0] = 0; r[1] = 0; r[2] = 1; r[3] = 1; }   // one pixel, unused
+        }
+        id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+        [ce setComputePipelineState:g_remap.signature];
+        [ce setTexture:tex atIndex:0];
+        [ce setBuffer:buf offset:0 atIndex:0];
+        [ce setBytes:rects length:g_remap.layoutCount * 4 * sizeof(float) atIndex:1];
+        [ce dispatchThreads:MTLSizeMake(48, 12, g_remap.layoutCount) threadsPerThreadgroup:MTLSizeMake(16, 4, 1)];
+        [ce endEncoding];
+        uint64_t generation = g_remap.generation;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            if (done.status != MTLCommandBufferStatusCompleted) return;
+            pthread_mutex_lock(&g_remap.lock);
+            if (generation == g_remap.generation) madeira_remap_choose(buf.contents);
+            pthread_mutex_unlock(&g_remap.lock);
+        }];
+    }
+
+    int active = g_remap.active;
+    int first = active >= 0 ? g_remap.layouts[active].first : 0;
+    int n = active >= 0 ? g_remap.layouts[active].count : 0;
     NSUInteger sx[MADEIRA_REMAP_MAX_ZONES], sy[MADEIRA_REMAP_MAX_ZONES], sw[MADEIRA_REMAP_MAX_ZONES], sh[MADEIRA_REMAP_MAX_ZONES];
     NSUInteger packW = 0, packH = 0;
     for (int i = 0; i < n; i++) {
-        MadeiraRemapZone z = g_remap.zones[i];
+        MadeiraRemapZone z = g_remap.zones[first + i];
         // source edges on the nearest pixel (a float 492/648 times 648 is 491.99997)
         sx[i] = (NSUInteger)MIN(lround(z.sx0 * W), (long)W - 1); sy[i] = (NSUInteger)MIN(lround(z.sy0 * H), (long)H - 1);
         sw[i] = (NSUInteger)MAX(MIN(lround(z.sx1 * W), (long)W) - (long)sx[i], 1);
@@ -489,11 +626,11 @@ void madeira_present_remap(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
         [enc setRenderPipelineState:fill];
         for (int i = 0; i < n; i++)
-            if (g_remap.zones[i].hide) madeira_remap_quad(enc, W, H, sx[i], sy[i], sx[i] + sw[i], sy[i] + sh[i], 0, 0, 1, 1);
+            if (g_remap.zones[first + i].hide) madeira_remap_quad(enc, W, H, sx[i], sy[i], sx[i] + sw[i], sy[i] + sh[i], 0, 0, 1, 1);
         [enc setRenderPipelineState:draw];
         [enc setFragmentTexture:scratch atIndex:0];
         for (int i = 0; i < n; i++) {
-            MadeiraRemapZone z = g_remap.zones[i];
+            MadeiraRemapZone z = g_remap.zones[first + i];
             madeira_remap_quad(enc, W, H, z.dx0 * W, z.dy0 * H, z.dx1 * W, z.dy1 * H, at[i], 0, at[i] + sw[i], sh[i]);
         }
         [enc endEncoding];

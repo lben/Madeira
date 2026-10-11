@@ -304,13 +304,24 @@ Shortcuts does not open, the restart notice shows as before.
 ## Screen layouts
 
 The in-game menu's **Screen layout** (games in the library) makes small text
-and HUD parts readable on a phone: the game's current frame is shown frozen,
-**Add zone** and a drag mark a part of it, and its copy, twice as large to begin
-with, can be moved and sized (0.5x to 4x) and can black out the original.
-A zone is changed by tapping its copy or its number in the bar. **Save** stores
-the zones with the game (`screenZones` in the library file) and they apply at
-once and in its next sessions; the menu's **Show screen layout** turns them off
-for the rest of the session.
+and HUD parts readable on a phone. The game's current frame is shown frozen. A
+game has up to eight **screens** (its menu, its game view, a shop...), each
+with its own zones:
+
+- **Add zone** and a drag mark a part of the frame; its copy, twice as large to
+  begin with, can be moved and sized (0.5x to 4x) and can black out the
+  original. A zone is changed by tapping its copy or its number in the bar.
+- **Set anchor** and a drag mark something that is always on this screen and
+  only on it (a logo, a fixed HUD icon). About ten times a second the hook reads
+  every anchor from the running game (a 48x12 luma signature, compared by edge
+  correlation; 0.45 or more selects, the same winner twice in a row) and draws
+  the screen that matches; when none does, the first screen without an anchor,
+  if any. The bar shows the anchor's live match.
+
+**Save** stores the screens with the game (`screenLayouts` in the library
+file; a layout saved before screens is read as one screen without an anchor)
+and they apply at once and in its next sessions; the menu's **Show screen
+layout** turns them off for the rest of the session.
 
 The game is not changed: the zones are drawn as the last step on each frame
 (`madeira_present_remap` in `IOSDisplayShim.m`, called by the dxmt fork's
@@ -318,8 +329,9 @@ winemetal before every present: D3D9/10/11 and D3D12), with a Lanczos-3
 filter, from the frame as the game drew it. A touch on a copy goes to the same
 spot of its source, in direct and Madeira Dock sessions (`mapPoint`,
 `winios_game_client_rect`); with the trackpad pointer, the game gets the spot
-the copy shows while the drawn arrow stays on the copy. Games drawn without DXMT (GDI, OpenGL) get no
-layout. `env.MADEIRA_SCREEN_LAYOUTS = 0` hides the editor and draws no zones.
+the copy shows while the drawn arrow stays on the copy. Games drawn without
+DXMT (GDI, OpenGL) get no layout. `env.MADEIRA_SCREEN_LAYOUTS = 0` hides the
+editor and draws no zones.
 
 ## First-run setup
 
