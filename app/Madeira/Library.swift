@@ -4644,11 +4644,11 @@ struct ScreenLayoutEditor: View {
                         .gesture(markGesture(frame), including: mode == .none ? .none : .all)
                         .onTapGesture { if mode == .none { selected = nil } }
                         .offset(x: frame.minX, y: frame.minY)
-                    // The chosen zone's anchor and marked part move under the zones' copies.
-                    if let i = selected, zones.indices.contains(i), mode == .none { boxes(i, frame: frame) }
                     ForEach(Array(zones.enumerated()), id: \.offset) { i, z in
                         if shown.indices.contains(i), shown[i] || selected == i { zoneView(i, z, image: image, frame: frame) }
                     }
+                    // Over the copies: a copy can cover the whole screen (a zone that enlarges the game's view).
+                    if let i = selected, zones.indices.contains(i), mode == .none { boxes(i, frame: frame) }
                     if let i = selected, zones.indices.contains(i), mode == .none { handles(i, frame: frame, size: geo.size) }
                     if let m = marking {
                         Rectangle().stroke(mode == .anchor ? .cyan : .yellow, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
@@ -4962,8 +4962,15 @@ struct ScreenLayoutEditor: View {
         }
     }
 
-    /// The chosen zone's anchor and marked part: drag inside to move.
+    /// The chosen zone's marked part and anchor: drag inside to move (the anchor on top,
+    /// as it often lies inside the marked part).
     @ViewBuilder private func boxes(_ i: Int, frame: CGRect) -> some View {
+        let s = Self.onScreen(zones[i].source, frame)
+        Rectangle().fill(.white.opacity(0.08))
+            .frame(width: s.width, height: s.height)
+            .contentShape(Rectangle())
+            .gesture(moveRect(.source, i, frame: frame))
+            .offset(x: s.minX, y: s.minY)
         if let a = zones[i].anchor {
             let r = Self.onScreen(a, frame)
             Rectangle().fill(.cyan.opacity(0.12))
@@ -4979,12 +4986,6 @@ struct ScreenLayoutEditor: View {
                 .gesture(moveRect(.anchor, i, frame: frame))
                 .offset(x: r.minX, y: r.minY)
         }
-        let s = Self.onScreen(zones[i].source, frame)
-        Rectangle().fill(.white.opacity(0.08))
-            .frame(width: s.width, height: s.height)
-            .contentShape(Rectangle())
-            .gesture(moveRect(.source, i, frame: frame))
-            .offset(x: s.minX, y: s.minY)
     }
 
     /// Sizing handles: the marked part and the anchor from their corners and sides (the
