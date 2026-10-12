@@ -20,19 +20,16 @@ void madeira_display_set_layer(CAMetalLayer *layer);
 extern NSString * const MadeiraDisplayModeChangedNotification;
 
 // Screen layouts (the last step on a game frame, see IOSDisplayShim.m).
-// `layoutCount` layouts (at most 8; 0 clears them). Layout l has zoneCounts[l]
-// zones, taken in order from `zones`, 10 floats each in the frame's normalised
-// coordinates (origin top-left): source x0 y0 x1 y1, destination x0 y0 x1 y1, hide
-// (0 no, 1 black, 2 blended from the pixels around it), sharp (1 = square pixels,
-// for pixel art; 0 = smooth Lanczos-3). anchors[l*4..]: its anchor rect, x0 y0 x1 y1, or -1s
-// for none; signatures[l*576..]: the anchor's 48x12 luma reference (row-major,
-// 0..1, box averages as the hook's remap_signature kernel computes them).
-void madeira_remap_set_layouts(int layoutCount, const int *zoneCounts, const float *zones,
-                               const float *anchors, const float *signatures);
-// The layout being drawn (-1: none), and the last match of a layout's anchor (-1 if
-// none yet); 1 is a perfect match, 0.45 the least that selects it.
-int madeira_remap_active_layout(void);
-float madeira_remap_layout_score(int layout);
+// `count` zones (at most 32; 0 clears them), 11 floats each in the frame's
+// normalised coordinates (origin top-left): source x0 y0 x1 y1, destination x0 y0
+// x1 y1, hide (0 no, 1 black, 2 blended from the pixels around it), sharp (1 = square
+// pixels, for pixel art; 0 = smooth Lanczos-3), sharpen (0 none, up to 3). anchors[i*4..]:
+// zone i's anchor rect, x0 y0 x1 y1, or -1s for none (always drawn); signatures[i*576..]:
+// the anchor's 48x12 luma reference (row-major, 0..1, box averages as the hook's
+// remap_signature kernel computes them).
+void madeira_remap_set_zones(int count, const float *zones, const float *anchors, const float *signatures);
+// Whether zone i is drawn now (its anchor matched, or it has none).
+int madeira_remap_zone_drawn(int zone);
 // Edge NCC of two 48x12 signatures (1 = the same picture).
 float madeira_remap_signature_match(const float *a, const float *b);
 // The next game frame as the game drew it (before any zone), on the main queue;

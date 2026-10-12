@@ -243,7 +243,6 @@ final class MetalBackedView: UIView {
             MetalBackedView.refreshDisplayMode(reason: "mode-changed")
         },
         NotificationCenter.default.addObserver(forName: UIDevice.orientationDidChangeNotification, object: nil, queue: .main) { _ in
-            ScreenZoom.boundsChanged()
             MetalBackedView.refreshDisplayMode(reason: "orientation")
         },
     ]
@@ -291,6 +290,7 @@ final class MetalBackedView: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         if let w = window {
+            ScreenZoom.boundsChanged(w)
             applyDisplayMode(reason: "layout")
             let full = ScreenZoom.unzoom(convert(bounds, to: w))
             winios_set_compositor_frame(full.minX, full.minY, full.width, full.height)
@@ -882,12 +882,15 @@ enum ScreenZoom {
         w.layer.sublayerTransform = scale == 1 ? CATransform3DIdentity : CATransform3DMakeAffineTransform(m)
         CATransaction.commit()
     }
-    /// A rotation: the zoom was set for the other shape.
-    static func boundsChanged() {
-        DispatchQueue.main.async { if let w = window, w.bounds.size != size { reset() } }   // after the bounds update
+    /// A rotation: the zoom was set for the other shape. Called from the game view's
+    /// layout, which runs once the window has its new bounds (the orientation
+    /// notification comes before them).
+    static func boundsChanged(_ w: UIWindow) {
+        if w === window, w.bounds.size != size { reset() }
     }
     static func reset() {
         guard let w = window, zoomed else { return }
+        fputs("[zoom] reset\n", stderr)
         set(scale: 1, offset: .zero, in: w)
         MetalBackedView.refreshDisplayMode(reason: "zoom-reset")
     }

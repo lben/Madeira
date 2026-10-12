@@ -304,34 +304,47 @@ Shortcuts does not open, the restart notice shows as before.
 ## Screen layouts
 
 The in-game menu's **Screen layout** (games in the library) makes small text
-and HUD parts readable on a phone. The game's current frame is shown frozen. A
-game has up to eight **screens** (its menu, its game view, a shop...), each
-with its own zones:
+and HUD parts readable on a phone. The game's current frame is shown frozen,
+with up to 32 **zones**:
 
-- **Add zone** and a drag mark a part of the frame; its copy, twice as large to
-  begin with, can be moved and sized (0.5x to 4x) and can black out the
-  original. A zone is changed by tapping its copy or its number in the bar.
-- **Set anchor** and a drag mark something that is always on this screen and
-  only on it (a logo, a fixed HUD icon). About ten times a second the hook reads
+- **Add zone** and a drag mark a part of the frame. Its copy, twice as large to
+  begin with, can be dragged, sized from its corners, with the slider or − / +
+  (0.5x to 6x), drawn **Smooth** (Lanczos-3) or **Sharp** (square pixels, for
+  pixel art), **sharpened** first (0 to 3: an unsharp mask at the source's own
+  pixels), and the original can be shown, blacked out or **blended** from the
+  pixels around it. The marked part moves by dragging inside it and is sized
+  from its corners and sides. A zone is changed by tapping its copy or its
+  number in the bar; later zones are drawn over earlier ones (**To front**).
+- Each zone has its own **anchor**: **Set anchor** and a drag mark something
+  that is always on the zone's screen and only on it (a logo, a fixed HUD icon);
+  it moves and sizes like a marked part. About ten times a second the hook reads
   every anchor from the running game (a 48x12 luma signature, compared by edge
-  correlation; 0.45 or more selects, the same winner twice in a row) and draws
-  the screen that matches; when none does, the first screen without an anchor,
-  if any. The bar shows the anchor's live match.
+  correlation; 0.45 or more matches, a change needs the same result twice in a
+  row) and draws the zones whose anchor matches. A zone without an anchor is
+  always drawn. A new zone takes the anchor of the zone it was added next to.
+  The bar shows how well the chosen zone's anchor matches the frozen frame, and
+  dims the numbers of zones that are not on it.
+- **Undo** and **Redo** go back as far as the editor's opening. The bar can be
+  dragged by its grip and folded into a **Layout** button, which can be dragged
+  too.
 
-**Save** stores the screens with the game (`screenLayouts` in the library
-file; a layout saved before screens is read as one screen without an anchor)
+**Save** stores the zones with the game (`screenZones` in the library file;
+a layout saved with screens is read with each screen's anchor on its zones)
 and they apply at once and in its next sessions; the menu's **Show screen
 layout** turns them off for the rest of the session.
 
 The game is not changed: the zones are drawn as the last step on each frame
 (`madeira_present_remap` in `IOSDisplayShim.m`, called by the dxmt fork's
-winemetal before every present: D3D9/10/11 and D3D12), with a Lanczos-3
-filter, from the frame as the game drew it. A touch on a copy goes to the same
-spot of its source, in direct and Madeira Dock sessions (`mapPoint`,
-`winios_game_client_rect`); with the trackpad pointer, the game gets the spot
-the copy shows while the drawn arrow stays on the copy. Games drawn without
-DXMT (GDI, OpenGL) get no layout. `env.MADEIRA_SCREEN_LAYOUTS = 0` hides the
-editor and draws no zones.
+winemetal before every present: D3D9/10/11 and D3D12), from the frame as the
+game drew it. A touch on a copy goes to the same spot of its source, in direct
+and Madeira Dock sessions (`mapPoint`, `winios_game_client_rect`); with the
+trackpad pointer, the game gets the spot the copy shows while the drawn arrow
+stays on the copy. Games drawn without DXMT (GDI, OpenGL) get no layout.
+`env.MADEIRA_SCREEN_LAYOUTS = 0` hides the editor and draws no zones.
+
+In a library session two fingers pinch to zoom the whole game view (1x to 4x)
+and pan it; pinching back to 1x, the menu's **Reset zoom** or a rotation of the
+phone returns it to normal.
 
 ## First-run setup
 

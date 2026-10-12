@@ -279,21 +279,22 @@ void macdrv_view_release_metal_view(macdrv_metal_view v) {
 // encode thread, before it presents it. Work encoded here lands in the game's own
 // command buffer, after the frame and before the present.
 //
-// A game has up to 8 layouts, one per screen of the game. A layout is a list of
-// zones in the frame's normalised coordinates (0..1, origin top-left): each copies
-// its source rect to its destination rect, smooth (Lanczos-3) or sharp (square
-// pixels with anti-aliased edges, for pixel art), and may hide the source, black or
-// blended from the pixels around it (a Coons patch of its border). All sources are copied out first, so zones read the frame as the game
-// drew it. A layout may have an anchor, a rect of the frame with the 48x12 luma
-// signature it had when the player chose it: every 6th frame the anchors are read
-// again on the GPU, and the layout whose anchor matches best (edge NCC >= 0.45,
-// the same winner twice in a row) is drawn; when none matches, the first layout
-// without an anchor, if any. The front end sets the running game's layouts
+// A game has up to 32 zones in the frame's normalised coordinates (0..1, origin
+// top-left): each copies its source rect to its destination rect, smooth (Lanczos-3)
+// or sharp (square pixels with anti-aliased edges, for pixel art), optionally
+// sharpened first (an unsharp mask at the source's own pixels), and may hide the
+// source, black or blended from the pixels around it (a Coons patch of its border).
+// All sources are copied out first, so zones read the frame as the game drew it, and
+// later zones are drawn over earlier ones. A zone may have an anchor, a rect of the
+// frame with the 48x12 luma signature it had when the player chose it: every 6th
+// frame the anchors are read again on the GPU, and a zone is drawn while its anchor
+// matches (edge NCC >= 0.45; a change needs the same result twice in a row). A zone
+// without an anchor is always drawn. The front end sets the running game's zones
 // (ScreenLayouts in Library.swift) and asks for one frame for its editor.
 
-#define MADEIRA_REMAP_MAX_ZONES 16
-#define MADEIRA_REMAP_MAX_LAYOUTS 8
+#define MADEIRA_REMAP_MAX_ZONES 32
 #define MADEIRA_REMAP_SIG 576          /* 48 x 12 */
+#define MADEIRA_REMAP_PACK 8192        /* the sources' scratch copy: rows at most this wide */
 #define MADEIRA_REMAP_MATCH 0.45f
 
 static NSString *const kRemapMSL = @
@@ -320,6 +321,13 @@ static NSString *const kRemapMSL = @
 "  return float4(clamp(acc.rgb / wsum, 0.0, 1.0), 1);\n"
 "}\n"
 "fragment float4 remap_fill_fs(VOut in [[stage_in]]) { return float4(0, 0, 0, 1); }\n"
+// sharpen: c + p.x * (c - mean of its 8 neighbours), reads inside the src rect
+"fragment float4 remap_sharpen_fs(VOut in [[stage_in]], texture2d<float> t [[texture(0)]], constant Quad &q [[buffer(0)]]) {\n"
+"  float2 p = floor(in.uv), lo = q.src.xy, hi = q.src.zw - 1;\n"
+"  float4 c = t.read(uint2(p)), s = 0;\n"
+"  for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) if (i != 0 || j != 0) s += t.read(uint2(clamp(p + float2(i, j), lo, hi)));\n"
+"  return float4(clamp(c.rgb + q.p.x * (c.rgb - s.rgb / 8), 0.0, 1.0), 1);\n"
+"}\n"
 // sharp: each source texel a square of p.xy destination pixels, its edges anti-aliased
 "fragment float4 remap_sharp_fs(VOut in [[stage_in]], texture2d<float> t [[texture(0)]], constant Quad &q [[buffer(0)]]) {\n"
 "  float2 p = in.uv - 0.5, i = floor(p), f = clamp((p - i - 0.5) * q.p.xy + 0.5, 0.0, 1.0);\n"
@@ -360,89 +368,78 @@ static NSString *const kRemapMSL = @
 "  out[g.z * 576 + g.y * 48 + g.x] = s / max(n, 1);\n"
 "}\n";
 
-// hide: 0 no, 1 black, 2 blended; sharp: 1 square pixels, 0 Lanczos
-typedef struct { float sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, hide, sharp; } MadeiraRemapZone;
+// hide: 0 no, 1 black, 2 blended; sharp: 1 square pixels, 0 Lanczos; sharpen: 0 none
 typedef struct {
-    int first, count;                     // its zones in g_remap.zones
+    float sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, hide, sharp, sharpen;
     int anchored;
     float anchor[4];                      // normalised x0 y0 x1 y1
     float reference[MADEIRA_REMAP_SIG];
     float score;                          // the last match, -1 before the first
-} MadeiraRemapLayout;
+    int drawn, pending, pendingRuns;      // drawn now; the last result and how often in a row
+} MadeiraRemapZone;
 
 static struct {
     pthread_mutex_t lock;
-    _Atomic int busy;   // layouts set or a capture waiting: the hook does nothing without it
-    MadeiraRemapZone zones[MADEIRA_REMAP_MAX_ZONES * MADEIRA_REMAP_MAX_LAYOUTS];   // 16 per layout
-    int zoneCount;
-    MadeiraRemapLayout layouts[MADEIRA_REMAP_MAX_LAYOUTS];
-    int layoutCount, anchoredCount, fallback;   // fallback: the first layout without an anchor, or -1
-    _Atomic int active;                         // the layout drawn, or -1
-    int pending, pendingRuns;
-    uint64_t frames, generation;           // generation: bumped by every set_layouts
+    _Atomic int busy;   // zones set or a capture waiting: the hook does nothing without it
+    MadeiraRemapZone zones[MADEIRA_REMAP_MAX_ZONES];
+    int zoneCount, anchoredCount;
+    uint64_t frames, generation;           // generation: bumped by every set_zones
     id<MTLBuffer> signatures[3];
     unsigned signatureNext;
     MadeiraFrameCapture capture;
     id<MTLDevice> device;
     id<MTLLibrary> library;
     NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *pipelines;   // "fs/format"
-    id<MTLTexture> scratch;
+    id<MTLTexture> scratch, sharpened;
     id<MTLComputePipelineState> signature;
     int failed;
 } g_remap = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
 static void madeira_remap_update_busy(void) {
-    g_remap.busy = g_remap.layoutCount > 0 || g_remap.capture != nil;
+    g_remap.busy = g_remap.zoneCount > 0 || g_remap.capture != nil;
 }
 
 static int madeira_remap_rect_ok(float x0, float y0, float x1, float y1) {
     return x0 >= 0 && y0 >= 0 && x1 <= 1 && y1 <= 1 && x1 > x0 && y1 > y0;   // false for NaN too
 }
 
-void madeira_remap_set_layouts(int layoutCount, const int *zoneCounts, const float *zones,
-                               const float *anchors, const float *signatures) {
-    if (layoutCount < 0 || !zoneCounts || !anchors || !signatures) layoutCount = 0;
-    if (layoutCount > MADEIRA_REMAP_MAX_LAYOUTS) layoutCount = MADEIRA_REMAP_MAX_LAYOUTS;
+void madeira_remap_set_zones(int count, const float *zones, const float *anchors, const float *signatures) {
+    if (count < 0 || !zones || !anchors || !signatures) count = 0;
+    if (count > MADEIRA_REMAP_MAX_ZONES) count = MADEIRA_REMAP_MAX_ZONES;
     pthread_mutex_lock(&g_remap.lock);
-    int z = 0, read = 0, anchored = 0;
-    g_remap.fallback = -1;
-    for (int l = 0; l < layoutCount; l++) {
-        MadeiraRemapLayout *L = &g_remap.layouts[l];
-        L->first = z; L->count = 0; L->score = -1;
-        for (int i = 0; i < zoneCounts[l]; i++, read++) {
-            MadeiraRemapZone c;
-            memcpy(&c, zones + read * 10, sizeof c);
-            if (L->count >= MADEIRA_REMAP_MAX_ZONES || !madeira_remap_rect_ok(c.sx0, c.sy0, c.sx1, c.sy1) ||
-                !madeira_remap_rect_ok(c.dx0, c.dy0, c.dx1, c.dy1)) continue;
-            g_remap.zones[z++] = c; L->count++;
+    int anchored = 0;
+    for (int i = 0; i < count; i++) {
+        const float *f = zones + i * 11, *a = anchors + i * 4;
+        MadeiraRemapZone *z = &g_remap.zones[i];   // the front end's index: madeira_remap_zone_drawn(i)
+        if (!madeira_remap_rect_ok(f[0], f[1], f[2], f[3]) || !madeira_remap_rect_ok(f[4], f[5], f[6], f[7])) {
+            z->anchored = 0; z->drawn = 0; z->pending = 0; z->score = -1;   // never drawn
+            continue;
         }
-        const float *a = anchors + l * 4;
-        L->anchored = madeira_remap_rect_ok(a[0], a[1], a[2], a[3]);
-        if (L->anchored) {
-            memcpy(L->anchor, a, sizeof L->anchor);
-            memcpy(L->reference, signatures + l * MADEIRA_REMAP_SIG, sizeof L->reference);
+        z->sx0 = f[0]; z->sy0 = f[1]; z->sx1 = f[2]; z->sy1 = f[3];
+        z->dx0 = f[4]; z->dy0 = f[5]; z->dx1 = f[6]; z->dy1 = f[7];
+        z->hide = f[8]; z->sharp = f[9]; z->sharpen = isfinite(f[10]) ? fminf(fmaxf(f[10], 0), 3) : 0;
+        z->anchored = madeira_remap_rect_ok(a[0], a[1], a[2], a[3]);
+        if (z->anchored) {
+            memcpy(z->anchor, a, sizeof z->anchor);
+            memcpy(z->reference, signatures + i * MADEIRA_REMAP_SIG, sizeof z->reference);
             anchored++;
-        } else if (g_remap.fallback < 0) g_remap.fallback = l;
+        }
+        // Until its anchor is read, a zone with one is not drawn.
+        z->score = -1; z->drawn = !z->anchored; z->pending = z->drawn; z->pendingRuns = 0;
     }
-    g_remap.zoneCount = z;
-    g_remap.layoutCount = layoutCount;
-    g_remap.generation++;
+    g_remap.zoneCount = count;
     g_remap.anchoredCount = anchored;
-    // Until the anchors are read, the layout without one.
-    g_remap.active = g_remap.fallback;
-    g_remap.pending = g_remap.fallback; g_remap.pendingRuns = 0;
+    g_remap.generation++;
     madeira_remap_update_busy();
     pthread_mutex_unlock(&g_remap.lock);
-    fprintf(stderr, "[screen-layout] %d layout(s), %d with an anchor, %d zone(s) applied\n", layoutCount, anchored, z);
+    fprintf(stderr, "[screen-layout] %d zone(s) applied, %d with an anchor\n", count, anchored);
 }
 
-int madeira_remap_active_layout(void) { return g_remap.active; }
-
-float madeira_remap_layout_score(int layout) {
+int madeira_remap_zone_drawn(int zone) {
     pthread_mutex_lock(&g_remap.lock);
-    float s = (layout >= 0 && layout < g_remap.layoutCount && g_remap.layouts[layout].anchored) ? g_remap.layouts[layout].score : -1;
+    int d = zone >= 0 && zone < g_remap.zoneCount && g_remap.zones[zone].drawn;
     pthread_mutex_unlock(&g_remap.lock);
-    return s;
+    return d;
 }
 
 // Normalised cross-correlation of the gradient magnitudes of two 48x12 signatures
@@ -461,20 +458,20 @@ float madeira_remap_signature_match(const float *a, const float *b) {
     return (da < 1e-9f || db < 1e-9f) ? 0 : num / sqrtf(da * db);
 }
 
-// On a frame's completion: score each anchor, pick the screen. Called with the lock held.
+// On a frame's completion: score each anchor (live holds them in zone order, anchored
+// zones only), decide each zone. Called with the lock held.
 static void madeira_remap_choose(const float *live) {
-    int best = -1; float bestScore = MADEIRA_REMAP_MATCH;
-    for (int l = 0; l < g_remap.layoutCount; l++) {
-        MadeiraRemapLayout *L = &g_remap.layouts[l];
-        if (!L->anchored) continue;
-        L->score = madeira_remap_signature_match(L->reference, live + l * MADEIRA_REMAP_SIG);
-        if (L->score >= bestScore) { best = l; bestScore = L->score; }
-    }
-    int want = best >= 0 ? best : g_remap.fallback;
-    if (want == g_remap.pending) g_remap.pendingRuns++; else { g_remap.pending = want; g_remap.pendingRuns = 1; }
-    if (want != g_remap.active && g_remap.pendingRuns >= 2) {
-        fprintf(stderr, "[screen-layout] screen %d -> %d (match %.2f)\n", g_remap.active, want, best >= 0 ? bestScore : 0);
-        g_remap.active = want;
+    int k = 0;
+    for (int i = 0; i < g_remap.zoneCount; i++) {
+        MadeiraRemapZone *z = &g_remap.zones[i];
+        if (!z->anchored) continue;
+        z->score = madeira_remap_signature_match(z->reference, live + k++ * MADEIRA_REMAP_SIG);
+        int want = z->score >= MADEIRA_REMAP_MATCH;
+        if (want == z->pending) z->pendingRuns++; else { z->pending = want; z->pendingRuns = 1; }
+        if (want != z->drawn && z->pendingRuns >= 2) {
+            fprintf(stderr, "[screen-layout] zone %d %s (match %.2f)\n", i + 1, want ? "shown" : "hidden", z->score);
+            z->drawn = want;
+        }
     }
 }
 
@@ -504,10 +501,10 @@ static BOOL madeira_remap_setup(id<MTLDevice> dev) {
         g_remap.failed = 1;
         return NO;
     }
-    g_remap.device = dev; g_remap.library = lib; g_remap.scratch = nil; g_remap.signature = sig;
+    g_remap.device = dev; g_remap.library = lib; g_remap.scratch = nil; g_remap.sharpened = nil; g_remap.signature = sig;
     g_remap.pipelines = [NSMutableDictionary new];
     for (int i = 0; i < 3; i++)
-        g_remap.signatures[i] = [dev newBufferWithLength:MADEIRA_REMAP_MAX_LAYOUTS * MADEIRA_REMAP_SIG * sizeof(float)
+        g_remap.signatures[i] = [dev newBufferWithLength:MADEIRA_REMAP_MAX_ZONES * MADEIRA_REMAP_SIG * sizeof(float)
                                                  options:MTLResourceStorageModeShared];
     return YES;
 }
@@ -591,19 +588,20 @@ void madeira_present_remap(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable
     // Every 6th frame the anchors, read from the frame as the game drew it.
     if (g_remap.anchoredCount > 0 && g_remap.frames++ % 6 == 0) {
         id<MTLBuffer> buf = g_remap.signatures[g_remap.signatureNext++ % 3];
-        float rects[MADEIRA_REMAP_MAX_LAYOUTS * 4];
-        for (int l = 0; l < g_remap.layoutCount; l++) {
-            const MadeiraRemapLayout *L = &g_remap.layouts[l];
-            float *r = rects + l * 4;
-            if (L->anchored) { r[0] = L->anchor[0] * W; r[1] = L->anchor[1] * H; r[2] = L->anchor[2] * W; r[3] = L->anchor[3] * H; }
-            else { r[0] = 0; r[1] = 0; r[2] = 1; r[3] = 1; }   // one pixel, unused
+        float rects[MADEIRA_REMAP_MAX_ZONES * 4];
+        int k = 0;
+        for (int i = 0; i < g_remap.zoneCount; i++) {
+            const MadeiraRemapZone *z = &g_remap.zones[i];
+            if (!z->anchored) continue;
+            float *r = rects + k++ * 4;
+            r[0] = z->anchor[0] * W; r[1] = z->anchor[1] * H; r[2] = z->anchor[2] * W; r[3] = z->anchor[3] * H;
         }
         id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
         [ce setComputePipelineState:g_remap.signature];
         [ce setTexture:tex atIndex:0];
         [ce setBuffer:buf offset:0 atIndex:0];
-        [ce setBytes:rects length:g_remap.layoutCount * 4 * sizeof(float) atIndex:1];
-        [ce dispatchThreads:MTLSizeMake(48, 12, g_remap.layoutCount) threadsPerThreadgroup:MTLSizeMake(16, 4, 1)];
+        [ce setBytes:rects length:k * 4 * sizeof(float) atIndex:1];
+        [ce dispatchThreads:MTLSizeMake(48, 12, k) threadsPerThreadgroup:MTLSizeMake(16, 4, 1)];
         [ce endEncoding];
         uint64_t generation = g_remap.generation;
         [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
@@ -614,69 +612,95 @@ void madeira_present_remap(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable
         }];
     }
 
-    int active = g_remap.active;
-    int first = active >= 0 ? g_remap.layouts[active].first : 0;
-    int n = active >= 0 ? g_remap.layouts[active].count : 0;
+    // The zones drawn now, in order, and where each source (with the pixels around it,
+    // the blend's border) goes in the scratch copy: rows at most MADEIRA_REMAP_PACK wide.
+    int list[MADEIRA_REMAP_MAX_ZONES], n = 0;
     NSUInteger sx[MADEIRA_REMAP_MAX_ZONES], sy[MADEIRA_REMAP_MAX_ZONES], sw[MADEIRA_REMAP_MAX_ZONES], sh[MADEIRA_REMAP_MAX_ZONES];
     NSUInteger ex[MADEIRA_REMAP_MAX_ZONES], ey[MADEIRA_REMAP_MAX_ZONES], ew[MADEIRA_REMAP_MAX_ZONES], eh[MADEIRA_REMAP_MAX_ZONES];
-    NSUInteger packW = 0, packH = 0;
-    for (int i = 0; i < n; i++) {
-        MadeiraRemapZone z = g_remap.zones[first + i];
+    NSUInteger atx[MADEIRA_REMAP_MAX_ZONES], aty[MADEIRA_REMAP_MAX_ZONES];
+    NSUInteger packW = 0, packH = 0, rowX = 0, rowY = 0, rowH = 0;
+    int sharpening = 0;
+    for (int i = 0; i < g_remap.zoneCount; i++) {
+        const MadeiraRemapZone *z = &g_remap.zones[i];
+        if (!z->drawn) continue;
         // source edges on the nearest pixel (a float 492/648 times 648 is 491.99997)
-        sx[i] = (NSUInteger)MIN(lround(z.sx0 * W), (long)W - 1); sy[i] = (NSUInteger)MIN(lround(z.sy0 * H), (long)H - 1);
-        sw[i] = (NSUInteger)MAX(MIN(lround(z.sx1 * W), (long)W) - (long)sx[i], 1);
-        sh[i] = (NSUInteger)MAX(MIN(lround(z.sy1 * H), (long)H) - (long)sy[i], 1);
-        // copied with the pixels around it (the blend's border), inside the frame
-        ex[i] = sx[i] > 0 ? sx[i] - 1 : 0; ey[i] = sy[i] > 0 ? sy[i] - 1 : 0;
-        ew[i] = MIN(sx[i] + sw[i] + 1, (NSUInteger)W) - ex[i]; eh[i] = MIN(sy[i] + sh[i] + 1, (NSUInteger)H) - ey[i];
-        packW += ew[i]; packH = MAX(packH, eh[i]);
+        sx[n] = (NSUInteger)MIN(lround(z->sx0 * W), (long)W - 1); sy[n] = (NSUInteger)MIN(lround(z->sy0 * H), (long)H - 1);
+        sw[n] = (NSUInteger)MAX(MIN(lround(z->sx1 * W), (long)W) - (long)sx[n], 1);
+        sh[n] = (NSUInteger)MAX(MIN(lround(z->sy1 * H), (long)H) - (long)sy[n], 1);
+        ex[n] = sx[n] > 0 ? sx[n] - 1 : 0; ey[n] = sy[n] > 0 ? sy[n] - 1 : 0;
+        ew[n] = MIN(sx[n] + sw[n] + 1, (NSUInteger)W) - ex[n]; eh[n] = MIN(sy[n] + sh[n] + 1, (NSUInteger)H) - ey[n];
+        if (rowX > 0 && rowX + ew[n] > MADEIRA_REMAP_PACK) { rowY += rowH; rowX = 0; rowH = 0; }
+        atx[n] = rowX; aty[n] = rowY;
+        rowX += ew[n]; rowH = MAX(rowH, eh[n]);
+        packW = MAX(packW, rowX); packH = MAX(packH, rowY + rowH);
+        if (z->sharpen > 0) sharpening = 1;
+        list[n++] = i;
     }
     id<MTLRenderPipelineState> draw = n ? madeira_remap_pipeline(@"remap_fs", tex.pixelFormat) : nil;
     id<MTLRenderPipelineState> sharp = n ? madeira_remap_pipeline(@"remap_sharp_fs", tex.pixelFormat) : nil;
     id<MTLRenderPipelineState> fill = n ? madeira_remap_pipeline(@"remap_fill_fs", tex.pixelFormat) : nil;
     id<MTLRenderPipelineState> blend = n ? madeira_remap_pipeline(@"remap_blend_fs", tex.pixelFormat) : nil;
-    if (n && draw && sharp && fill && blend && packW && packH) {
-        // the sources side by side in one scratch texture, copied before anything is drawn
+    id<MTLRenderPipelineState> sharpen = sharpening ? madeira_remap_pipeline(@"remap_sharpen_fs", tex.pixelFormat) : nil;
+    if (n && draw && sharp && fill && blend && (sharpen || !sharpening) && packW && packH && packW <= 16384 && packH <= 16384) {
+        // the sources in one scratch texture, copied before anything is drawn
         if (!g_remap.scratch || g_remap.scratch.width < packW || g_remap.scratch.height < packH || g_remap.scratch.pixelFormat != tex.pixelFormat) {
             MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:tex.pixelFormat
                                        width:MAX(packW, g_remap.scratch.width) height:MAX(packH, g_remap.scratch.height) mipmapped:NO];
             d.usage = MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate;
             g_remap.scratch = [tex.device newTextureWithDescriptor:d];
+            // the sharpened sources, at the same places
+            d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+            g_remap.sharpened = [tex.device newTextureWithDescriptor:d];
         }
-        id<MTLTexture> scratch = g_remap.scratch;
-        if (!scratch) { pthread_mutex_unlock(&g_remap.lock); return; }
-        NSUInteger at[MADEIRA_REMAP_MAX_ZONES], x = 0;
+        id<MTLTexture> scratch = g_remap.scratch, sharpened = g_remap.sharpened;
+        if (!scratch || !sharpened) { pthread_mutex_unlock(&g_remap.lock); return; }
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-        for (int i = 0; i < n; i++) {
-            [blit copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(ex[i], ey[i], 0)
-                       sourceSize:MTLSizeMake(ew[i], eh[i], 1) toTexture:scratch destinationSlice:0
-                 destinationLevel:0 destinationOrigin:MTLOriginMake(x, 0, 0)];
-            at[i] = x; x += ew[i];
-        }
+        for (int k = 0; k < n; k++)
+            [blit copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(ex[k], ey[k], 0)
+                       sourceSize:MTLSizeMake(ew[k], eh[k], 1) toTexture:scratch destinationSlice:0
+                 destinationLevel:0 destinationOrigin:MTLOriginMake(atx[k], aty[k], 0)];
         [blit endEncoding];
+        if (sharpening) {
+            MTLRenderPassDescriptor *sp = [MTLRenderPassDescriptor renderPassDescriptor];
+            sp.colorAttachments[0].texture = sharpened;
+            sp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            sp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> se = [cb renderCommandEncoderWithDescriptor:sp];
+            [se setRenderPipelineState:sharpen];
+            [se setFragmentTexture:scratch atIndex:0];
+            for (int k = 0; k < n; k++) {
+                float amount = g_remap.zones[list[k]].sharpen;
+                if (amount <= 0) continue;
+                float p[4] = { amount, 0, 0, 0 };
+                madeira_remap_quad(se, sharpened.width, sharpened.height, atx[k], aty[k], atx[k] + ew[k], aty[k] + eh[k],
+                                   atx[k], aty[k], atx[k] + ew[k], aty[k] + eh[k], p);
+            }
+            [se endEncoding];
+        }
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture = tex;
         rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
         [enc setFragmentTexture:scratch atIndex:0];
-        for (int i = 0; i < n; i++) {
-            float hide = g_remap.zones[first + i].hide;
+        for (int k = 0; k < n; k++) {
+            float hide = g_remap.zones[list[k]].hide;
             if (hide <= 0) continue;
             // the source inside the scratch copy, and the ring of pixels around it
-            double ix = at[i] + (sx[i] - ex[i]), iy = sy[i] - ey[i];
-            float ring[4] = { (float)(sx[i] > ex[i] ? ix - 1 : ix), (float)(sy[i] > ey[i] ? iy - 1 : iy),
-                              (float)(ex[i] + ew[i] > sx[i] + sw[i] ? ix + sw[i] : ix + sw[i] - 1),
-                              (float)(ey[i] + eh[i] > sy[i] + sh[i] ? iy + sh[i] : iy + sh[i] - 1) };
+            double ix = atx[k] + (sx[k] - ex[k]), iy = aty[k] + (sy[k] - ey[k]);
+            float ring[4] = { (float)(sx[k] > ex[k] ? ix - 1 : ix), (float)(sy[k] > ey[k] ? iy - 1 : iy),
+                              (float)(ex[k] + ew[k] > sx[k] + sw[k] ? ix + sw[k] : ix + sw[k] - 1),
+                              (float)(ey[k] + eh[k] > sy[k] + sh[k] ? iy + sh[k] : iy + sh[k] - 1) };
             [enc setRenderPipelineState:hide >= 2 ? blend : fill];
-            madeira_remap_quad(enc, W, H, sx[i], sy[i], sx[i] + sw[i], sy[i] + sh[i], ix, iy, ix + sw[i], iy + sh[i], ring);
+            madeira_remap_quad(enc, W, H, sx[k], sy[k], sx[k] + sw[k], sy[k] + sh[k], ix, iy, ix + sw[k], iy + sh[k], ring);
         }
-        for (int i = 0; i < n; i++) {
-            MadeiraRemapZone z = g_remap.zones[first + i];
-            double ix = at[i] + (sx[i] - ex[i]), iy = sy[i] - ey[i];
-            float scale[4] = { (float)((z.dx1 - z.dx0) * W / sw[i]), (float)((z.dy1 - z.dy0) * H / sh[i]), 0, 0 };
-            [enc setRenderPipelineState:z.sharp > 0 ? sharp : draw];
-            madeira_remap_quad(enc, W, H, z.dx0 * W, z.dy0 * H, z.dx1 * W, z.dy1 * H, ix, iy, ix + sw[i], iy + sh[i], scale);
+        for (int k = 0; k < n; k++) {
+            const MadeiraRemapZone *z = &g_remap.zones[list[k]];
+            double ix = atx[k] + (sx[k] - ex[k]), iy = aty[k] + (sy[k] - ey[k]);
+            float scale[4] = { (float)((z->dx1 - z->dx0) * W / sw[k]), (float)((z->dy1 - z->dy0) * H / sh[k]), 0, 0 };
+            [enc setFragmentTexture:z->sharpen > 0 ? sharpened : scratch atIndex:0];
+            [enc setRenderPipelineState:z->sharp > 0 ? sharp : draw];
+            madeira_remap_quad(enc, W, H, z->dx0 * W, z->dy0 * H, z->dx1 * W, z->dy1 * H, ix, iy, ix + sw[k], iy + sh[k], scale);
         }
         [enc endEncoding];
     }
