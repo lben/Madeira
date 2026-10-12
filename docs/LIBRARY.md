@@ -315,6 +315,14 @@ with up to 32 **zones**:
   pixels around it. The marked part moves by dragging inside it and is sized
   from its corners and sides. A zone is changed by tapping its copy or its
   number in the bar; later zones are drawn over earlier ones (**To front**).
+- **Find text** and a drag over some text or numbers make a zone of each line of
+  text found there (Apple's Vision text recognition, on the frozen frame): the
+  copies are enlarged 2x as a group, from the corner of the dragged area nearest
+  the screen's edges (so they keep their order and do not overlap), drawn
+  **see-through** and the originals blended away. A see-through copy (a zone's
+  **Copy: See-through**) draws only what differs from the colour around its
+  source, the mean of the source's border read on every frame, so the text is
+  enlarged over the game rather than over a copy of its background.
 - Each zone has its own **anchor**: **Set anchor** and a drag mark something
   that is always on the zone's screen and only on it (a logo, a fixed HUD icon);
   it moves and sizes like a marked part. About ten times a second the hook reads

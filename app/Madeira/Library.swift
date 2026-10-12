@@ -4,6 +4,7 @@ import UIKit
 import Darwin
 import ImageIO
 import CoreImage
+import Vision
 import Combine
 
 // ============================================================================
@@ -4459,6 +4460,8 @@ struct ScreenZone: Codable, Equatable {
     var sharp: Bool?
     /// An unsharp mask at the source's own pixels before it is scaled: 0 (nil) to 3.
     var sharpen: Double?
+    /// Only what differs from the colour around the source is drawn (text over the game).
+    var seeThrough: Bool?
     /// A part of the frame that tells the zone's screen apart (normalised), with its
     /// 48x12 luma `signature` from when the player chose it.
     var anchor: CGRect?
@@ -4505,7 +4508,7 @@ enum ScreenLayouts {
             geometry += [z.source.minX, z.source.minY, z.source.maxX, z.source.maxY,
                          z.destination.minX, z.destination.minY, z.destination.maxX, z.destination.maxY,
                          z.hideSource == true ? (z.blendSource == true ? 2 : 1) : 0, z.sharp == true ? 1 : 0,
-                         CGFloat(z.sharpen ?? 0)].map { Float($0) }
+                         CGFloat(z.sharpen ?? 0), z.seeThrough == true ? 1 : 0].map { Float($0) }
             if z.anchored, let a = z.anchor, let sig = z.signature {
                 anchors += [a.minX, a.minY, a.maxX, a.maxY].map { Float($0) }
                 signatures += sig
@@ -4544,6 +4547,33 @@ enum ScreenLayouts {
         out.origin.x = min(max(out.minX, 0), 1 - out.width)
         out.origin.y = min(max(out.minY, 0), 1 - out.height)
         return out
+    }
+
+    /// The lines of text Vision reads in `rect` of `image` (both normalised), each with a
+    /// margin of a quarter of its height. Read from that part enlarged 2x: small game
+    /// fonts are found far more often so.
+    static func textBoxes(in image: CGImage, rect: CGRect) -> [CGRect] {
+        let px = CGRect(x: rect.minX * CGFloat(image.width), y: rect.minY * CGFloat(image.height),
+                        width: rect.width * CGFloat(image.width), height: rect.height * CGFloat(image.height)).integral
+        guard px.width >= 4, px.height >= 4, let crop = image.cropping(to: px) else { return [] }
+        let W = crop.width * 2, H = crop.height * 2
+        guard let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: W * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return [] }
+        ctx.interpolationQuality = .high
+        ctx.draw(crop, in: CGRect(x: 0, y: 0, width: W, height: H))
+        guard let big = ctx.makeImage() else { return [] }
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = false
+        try? VNImageRequestHandler(cgImage: big).perform([request])
+        let unit = CGRect(x: 0, y: 0, width: 1, height: 1)
+        return (request.results ?? []).map { o in
+            let b = o.boundingBox   // in the crop, normalised, origin bottom-left
+            let r = CGRect(x: (px.minX + b.minX * px.width) / CGFloat(image.width),
+                           y: (px.minY + (1 - b.maxY) * px.height) / CGFloat(image.height),
+                           width: b.width * px.width / CGFloat(image.width), height: b.height * px.height / CGFloat(image.height))
+            return r.insetBy(dx: -r.height / 4, dy: -r.height / 4).intersection(unit)
+        }.filter { !$0.isEmpty }
     }
 
     /// A frame's luma (0...1), row-major, read once for the signatures of its anchors.
@@ -4595,7 +4625,9 @@ enum ScreenLayouts {
 /// it and sized from its corners and sides. Each zone has its own anchor, a part of the
 /// frame that is always on the zone's screen and only there; the zone is drawn while the
 /// anchor matches, and always without one. A new zone takes the anchor of the zone it
-/// was added next to. Undo and Redo go back to the editor's opening. The bar can be
+/// was added next to. Find text, then a drag over some text, makes a zone of each line of
+/// text found there: enlarged 2x as a group, see-through, the originals blended away.
+/// Undo and Redo go back to the editor's opening. The bar can be
 /// dragged by its grip and folded into a button that can be dragged too. Save stores the
 /// zones with the game.
 struct ScreenLayoutEditor: View {
@@ -4621,7 +4653,9 @@ struct ScreenLayoutEditor: View {
     @State private var barFrom: CGSize?
     @State private var folded = false
     @State private var cache = EditorCache()
-    private enum Mode { case none, zone, anchor }
+    @State private var finding = false
+    @State private var notice: String?
+    private enum Mode { case none, zone, anchor, text }
     private enum Part { case source, destination, anchor }
     private static let scales: ClosedRange<Double> = 0.5...6
 
@@ -4651,7 +4685,7 @@ struct ScreenLayoutEditor: View {
                     if let i = selected, zones.indices.contains(i), mode == .none { boxes(i, frame: frame) }
                     if let i = selected, zones.indices.contains(i), mode == .none { handles(i, frame: frame, size: geo.size) }
                     if let m = marking {
-                        Rectangle().stroke(mode == .anchor ? .cyan : .yellow, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+                        Rectangle().stroke(mode == .anchor ? .cyan : mode == .text ? .green : .yellow, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
                             .frame(width: m.width * frame.width, height: m.height * frame.height)
                             .offset(x: frame.minX + m.minX * frame.width, y: frame.minY + m.minY * frame.height)
                             .allowsHitTesting(false)
@@ -4684,7 +4718,15 @@ struct ScreenLayoutEditor: View {
 
     @ViewBuilder private func barView(_ size: CGSize, shown: [Bool]) -> some View {
         Group {
-            if mode != .none {
+            if finding {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("Finding text…").font(.caption)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 6)
+                .background(.ultraThinMaterial, in: Capsule())
+                .offset(x: bar.width, y: bar.height)
+            } else if mode != .none {
                 // Marking: only a hint, so the whole frame can be reached.
                 HStack(spacing: 10) {
                     Text(hint).font(.caption)
@@ -4712,6 +4754,7 @@ struct ScreenLayoutEditor: View {
 
     private var hint: String {
         if mode == .anchor { return "Drag over something that is always on this zone's screen, and only on it" }
+        if mode == .text { return "Drag over the text or numbers you want larger" }
         if let a = anchorFrom { return "Drag over what you want larger (it gets the anchor of zone \(a + 1))" }
         return "Drag over what you want larger"
     }
@@ -4750,7 +4793,9 @@ struct ScreenLayoutEditor: View {
                         }
                     }.frame(width: min(CGFloat(zones.count) * 42, 240))
                 }
-                Button("Add zone", systemImage: "plus.rectangle.on.rectangle") { startZone(shown) }
+                Button("Add zone", systemImage: "plus.rectangle.on.rectangle") { startZone(shown, .zone) }
+                    .disabled(image == nil || zones.count >= ScreenLayouts.maxZones)
+                Button("Find text", systemImage: "text.viewfinder") { startZone(shown, .text) }
                     .disabled(image == nil || zones.count >= ScreenLayouts.maxZones)
                 Spacer(minLength: 8)
                 Button("Fold the bar", systemImage: "chevron.down.circle") { folded = true }.labelStyle(.iconOnly)
@@ -4759,6 +4804,7 @@ struct ScreenLayoutEditor: View {
                     model.layoutEditing = false
                 }.buttonStyle(.borderedProminent)
             }.fixedSize()
+            if let notice { Text(notice).font(.caption).foregroundStyle(.secondary) }
             if let i = selected, zones.indices.contains(i) {
                 zoneControls(i)
             } else {
@@ -4829,6 +4875,10 @@ struct ScreenLayoutEditor: View {
                                                  set: { v in edit(i) { $0.sharp = v ? true : nil } })) {
                 Text("Smooth").tag(false); Text("Sharp").tag(true)
             }.pickerStyle(.segmented).frame(width: 130)
+            Picker("Copy", selection: Binding(get: { zones.indices.contains(i) && zones[i].seeThrough == true },
+                                              set: { v in edit(i) { $0.seeThrough = v ? true : nil } })) {
+                Text("Solid").tag(false); Text("See-through").tag(true)
+            }.pickerStyle(.segmented).frame(width: 210)
         }.fixedSize()
         HStack(spacing: 8) {
             Text("Sharpen").font(.caption)
@@ -4907,12 +4957,40 @@ struct ScreenLayoutEditor: View {
         }
     }
 
-    /// Add zone: the new zone takes the anchor of the chosen zone, or of the last zone
-    /// with an anchor on this screen, when there is one.
-    private func startZone(_ shown: [Bool]) {
+    /// Add zone or Find text: the new zones take the anchor of the chosen zone, or of the
+    /// last zone with an anchor on this screen, when there is one.
+    private func startZone(_ shown: [Bool], _ next: Mode) {
         let mine = { (i: Int) in zones.indices.contains(i) && zones[i].anchored && shown.indices.contains(i) && shown[i] }
         anchorFrom = selected.flatMap { mine($0) ? $0 : nil } ?? zones.indices.last(where: mine)
-        mode = .zone; selected = nil
+        mode = next; selected = nil; notice = nil
+    }
+
+    /// Find text: a zone for each line of text found in `rect`, enlarged 2x about the
+    /// rect's corner nearest the screen's edges (so they keep their places and do not
+    /// overlap), see-through, the originals blended away.
+    private func findText(in rect: CGRect) {
+        guard let image else { return }
+        let from = anchorFrom.flatMap { zones.indices.contains($0) ? zones[$0] : nil }
+        finding = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let boxes = ScreenLayouts.textBoxes(in: image, rect: rect)
+            DispatchQueue.main.async {
+                finding = false
+                let room = ScreenLayouts.maxZones - zones.count
+                guard !boxes.isEmpty, room > 0 else { notice = boxes.isEmpty ? "No text found there." : "No room for more zones."; return }
+                record()
+                let p = CGPoint(x: rect.midX < 0.5 ? rect.minX : rect.maxX, y: rect.midY < 0.5 ? rect.minY : rect.maxY)
+                for b in boxes.prefix(room) {
+                    var z = ScreenZone(source: b, destination: ScreenLayouts.inside(
+                        CGRect(x: p.x + 2 * (b.minX - p.x), y: p.y + 2 * (b.minY - p.y), width: 2 * b.width, height: 2 * b.height)))
+                    z.hideSource = true; z.blendSource = true; z.seeThrough = true
+                    if let from { z.anchor = from.anchor; z.signature = from.signature }
+                    zones.append(z)
+                }
+                selected = zones.count - 1
+                notice = "\(min(boxes.count, room)) zone(s) from the text found."
+            }
+        }
     }
 
     /// The frozen frame, as large as fits.
@@ -5079,10 +5157,13 @@ struct ScreenLayoutEditor: View {
     private func piece(_ z: ScreenZone, image: CGImage) -> CGImage? {
         let pixels = CGRect(x: z.source.minX * CGFloat(image.width), y: z.source.minY * CGFloat(image.height),
                             width: z.source.width * CGFloat(image.width), height: z.source.height * CGFloat(image.height)).integral
-        let key = "\(pixels)|\(z.sharpen ?? 0)"
+        let key = "\(pixels)|\(z.sharpen ?? 0)|\(z.seeThrough == true)"
         if let p = cache.pieces[key] { return p }
         guard let crop = image.cropping(to: pixels) else { return nil }
-        let out = (z.sharpen ?? 0) > 0 ? Self.sharpened(crop, z.sharpen ?? 0) ?? crop : crop
+        var out = (z.sharpen ?? 0) > 0 ? Self.sharpened(crop, z.sharpen ?? 0) ?? crop : crop
+        if z.seeThrough == true, let ring = image.cropping(to: pixels.insetBy(dx: -1, dy: -1)) {
+            out = Self.seeThrough(out, ring: ring) ?? out
+        }
         if cache.pieces.count > 64 { cache.pieces.removeAll() }   // a drag makes a new piece per step
         cache.pieces[key] = out
         return out
@@ -5103,6 +5184,33 @@ struct ScreenLayoutEditor: View {
         return context.createCGImage(out, from: input.extent)
     }
 
+    /// The hook's see-through: each pixel's alpha from its distance to the mean colour of
+    /// the border of `ring` (the source with the pixels around it).
+    private static func seeThrough(_ piece: CGImage, ring: CGImage) -> CGImage? {
+        func bitmap(_ image: CGImage) -> (CGContext, UnsafeMutablePointer<UInt8>)? {
+            guard let c = CGContext(data: nil, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                                    space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+                  let data = c.data else { return nil }
+            c.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+            return (c, data.bindMemory(to: UInt8.self, capacity: image.width * image.height * 4))
+        }
+        guard let r = bitmap(ring), let p = bitmap(piece) else { return nil }
+        let w = ring.width, h = ring.height
+        var mean: [Float] = [0, 0, 0], n: Float = 0
+        for y in 0..<h { for x in 0..<w where y == 0 || y == h - 1 || x == 0 || x == w - 1 {
+            for c in 0..<3 { mean[c] += Float(r.1[(y * w + x) * 4 + c]) / 255 }
+            n += 1
+        } }
+        mean = mean.map { $0 / max(n, 1) }
+        for i in 0..<(piece.width * piece.height) {
+            var d: Float = 0
+            for c in 0..<3 { let v = Float(p.1[i * 4 + c]) / 255 - mean[c]; d += v * v }
+            let t = min(max((d.squareRoot() - 0.10) / 0.20, 0), 1), a = t * t * (3 - 2 * t)
+            for c in 0..<4 { p.1[i * 4 + c] = UInt8((Float(p.1[i * 4 + c]) * a).rounded()) }
+        }
+        return p.0.makeImage()
+    }
+
     private func markGesture(_ frame: CGRect) -> some Gesture {
         DragGesture(minimumDistance: 4, coordinateSpace: .local).onChanged { g in
             let a = CGPoint(x: g.startLocation.x / frame.width, y: g.startLocation.y / frame.height)
@@ -5112,6 +5220,7 @@ struct ScreenLayoutEditor: View {
         }.onEnded { _ in
             defer { marking = nil; mode = .none; anchorFrom = nil }
             guard let m = marking, m.width > 0.01, m.height > 0.01 else { return }
+            if mode == .text { findText(in: m); return }
             record()
             if mode == .anchor {
                 if let i = selected { setAnchor(i, m) }
