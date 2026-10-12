@@ -279,7 +279,7 @@ void macdrv_view_release_metal_view(macdrv_metal_view v) {
 // encode thread, before it presents it. Work encoded here lands in the game's own
 // command buffer, after the frame and before the present.
 //
-// A game has up to 32 zones in the frame's normalised coordinates (0..1, origin
+// A game has up to 64 zones in the frame's normalised coordinates (0..1, origin
 // top-left): each copies its source rect to its destination rect, smooth (Lanczos-3)
 // or sharp (square pixels with anti-aliased edges, for pixel art), optionally
 // sharpened first (an unsharp mask at the source's own pixels), and may hide the
@@ -295,7 +295,7 @@ void macdrv_view_release_metal_view(macdrv_metal_view v) {
 // without an anchor is always drawn. The front end sets the running game's zones
 // (ScreenLayouts in Library.swift) and asks for one frame for its editor.
 
-#define MADEIRA_REMAP_MAX_ZONES 32
+#define MADEIRA_REMAP_MAX_ZONES 64
 #define MADEIRA_REMAP_SIG 576          /* 48 x 12 */
 #define MADEIRA_REMAP_PACK 8192        /* the sources' scratch copy: rows at most this wide */
 #define MADEIRA_REMAP_MATCH 0.45f

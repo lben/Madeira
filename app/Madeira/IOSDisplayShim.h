@@ -20,7 +20,7 @@ void madeira_display_set_layer(CAMetalLayer *layer);
 extern NSString * const MadeiraDisplayModeChangedNotification;
 
 // Screen layouts (the last step on a game frame, see IOSDisplayShim.m).
-// `count` zones (at most 32; 0 clears them), 12 floats each in the frame's
+// `count` zones (at most 64; 0 clears them), 12 floats each in the frame's
 // normalised coordinates (origin top-left): source x0 y0 x1 y1, destination x0 y0
 // x1 y1, hide (0 no, 1 black, 2 blended from the pixels around it), sharp (1 = square
 // pixels, for pixel art; 0 = smooth Lanczos-3), sharpen (0 none, up to 3), see-through

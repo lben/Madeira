@@ -305,41 +305,42 @@ Shortcuts does not open, the restart notice shows as before.
 
 The in-game menu's **Screen layout** (games in the library) makes small text
 and HUD parts readable on a phone. The game's current frame is shown frozen,
-with up to 32 **zones**:
+with the game's layout as a tree on the left: **screens**, their **zones**, and
+the zones' **parts**.
 
-- **Add zone** and a drag mark a part of the frame. Its copy, twice as large to
-  begin with, can be dragged, sized from its corners, with the slider or − / +
-  (0.5x to 6x), drawn **Smooth** (Lanczos-3) or **Sharp** (square pixels, for
-  pixel art), **sharpened** first (0 to 3: an unsharp mask at the source's own
-  pixels), and the original can be shown, blacked out or **blended** from the
-  pixels around it. The marked part moves by dragging inside it and is sized
-  from its corners and sides. A zone is changed by tapping its copy or its
-  number in the bar; later zones are drawn over earlier ones (**To front**).
-- **Find text** and a drag over some text or numbers make a zone of each line of
-  text found there (Apple's Vision text recognition, on the frozen frame): the
-  copies are enlarged 2x as a group, from the corner of the dragged area nearest
-  the screen's edges (so they keep their order and do not overlap), drawn
-  **see-through** and the originals blended away. A see-through copy (a zone's
-  **Copy: See-through**) draws only what differs from the colour around its
-  source, the mean of the source's border read on every frame, so the text is
-  enlarged over the game rather than over a copy of its background.
-- Each zone has its own **anchor**: **Set anchor** and a drag mark something
-  that is always on the zone's screen and only on it (a logo, a fixed HUD icon);
-  it moves and sizes like a marked part. About ten times a second the hook reads
-  every anchor from the running game (a 48x12 luma signature, compared by edge
-  correlation; 0.45 or more matches, a change needs the same result twice in a
-  row) and draws the zones whose anchor matches. A zone without an anchor is
-  always drawn. A new zone takes the anchor of the zone it was added next to.
-  The bar shows how well the chosen zone's anchor matches the frozen frame, and
-  dims the numbers of zones that are not on it.
-- **Undo** and **Redo** go back as far as the editor's opening. The bar can be
-  dragged by its grip and folded into a **Layout** button, which can be dragged
-  too.
+- A **screen** is something the game shows (its menu, its base, a level-up
+  panel). **New screen** and a drag mark its **anchor**: something that is
+  always on that screen and only there (a logo, a fixed HUD icon). About ten
+  times a second the hook reads every anchor from the running game (a 48x12
+  luma signature, compared by edge correlation; 0.45 or more matches, a change
+  needs the same result twice in a row) and draws the zones of every screen
+  whose anchor matches. **Always**, the one screen without an anchor, is drawn
+  on every screen. The tree shows each screen's match on the frozen frame; the
+  ones not on it are dimmed and their zones are not drawn.
+- A **zone** is one or more parts of the frame drawn again together, keeping
+  their arrangement: dragged and sized as one (corners, slider or − / +, 0.5x
+  to 6x), drawn **Smooth** (Lanczos-3) or **Sharp** (square pixels, for pixel
+  art), **sharpened** first (0 to 3: an unsharp mask at the parts' own pixels),
+  **solid** or **see-through** (only what differs from the colour around each
+  part, read on every frame, so text is enlarged over the game), and the
+  originals shown, blacked out or **blended** from the pixels around them.
+  **Add zone** and a drag make a zone of one part in the chosen screen (else
+  the one the frame shows, else Always); **+ Part** and a drag add a part to the
+  chosen zone; **Find text** and a drag over some text make one zone of every
+  line of text Apple's Vision reads there (enlarged 2x from the dragged area's
+  corner nearest the screen's edges, see-through, the originals blended). A
+  zone can **Move to** another screen; a part can be **Separated** into a zone
+  of its own or deleted. A part is moved by dragging inside it and sized from
+  its corners and sides; a screen's anchor too.
+- Screens, and the zones in each, are drawn in the tree's order, later ones on
+  top (**To front**). **Undo** and **Redo** go back as far as the editor's
+  opening. The tree and the bar fold away; the folded bar's button can be
+  dragged.
 
-**Save** stores the zones with the game (`screenZones` in the library file;
-a layout saved with screens is read with each screen's anchor on its zones)
-and they apply at once and in its next sessions; the menu's **Show screen
-layout** turns them off for the rest of the session.
+**Save** stores the screens with the game (`layoutScreens` in the library file;
+layouts of earlier builds are read with a screen for each anchor, zones without
+one in Always) and they apply at once and in its next sessions; the menu's
+**Show screen layout** turns them off for the rest of the session.
 
 The game is not changed: the zones are drawn as the last step on each frame
 (`madeira_present_remap` in `IOSDisplayShim.m`, called by the dxmt fork's
