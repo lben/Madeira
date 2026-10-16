@@ -333,7 +333,9 @@ the zones' **parts**.
   of its own or deleted. A part is moved by dragging inside it and sized from
   its corners and sides; a screen's anchor too.
 - Screens, and the zones in each, are drawn in the tree's order, later ones on
-  top (**To front**). **Undo** and **Redo** go back as far as the editor's
+  top (**To front**). The eye on a zone's row hides it in the editor only (not
+  saved), so what lies under a large copy can be marked; choosing the zone or
+  the eye again shows it. **Undo** and **Redo** go back as far as the editor's
   opening. The tree and the bar fold away; the folded bar's button can be
   dragged.
 

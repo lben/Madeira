@@ -4854,8 +4854,9 @@ enum ScreenLayouts {
 /// zone; Find text makes one zone of the text found in a dragged area. A zone's copies are
 /// dragged and sized together (corners, slider, − / +); a part, or a screen's anchor, is
 /// moved by dragging inside it and sized from its corners and sides. Screens and zones not
-/// on this frame are dimmed and not drawn. Undo and Redo go back to the editor's opening;
-/// the tree and the bar fold away. Save stores the screens with the game.
+/// on this frame are dimmed and not drawn; the eye on a zone's row hides it while editing.
+/// Undo and Redo go back to the editor's opening; the tree and the bar fold away. Save
+/// stores the screens with the game.
 struct ScreenLayoutEditor: View {
     @ObservedObject private var model = LibraryModel.shared
     @State private var image: CGImage?
@@ -4885,6 +4886,9 @@ struct ScreenLayoutEditor: View {
     @State private var notice: String?
     /// The scaling a new zone gets: the one chosen last.
     @State private var lastSharp: Bool?
+    /// Zones hidden in the editor (the eye on their row), so what lies under them can be
+    /// marked. Kept by value: choosing or changing a zone shows it again. Not saved.
+    @State private var hidden: [LayoutZone] = []
     private enum Mode { case none, newScreen, anchor, zone, part, text }
     private enum Selection: Equatable { case screen(Int), zone(Int, Int), part(Int, Int, Int) }
     private static let scales: ClosedRange<Double> = 0.5...6
@@ -4910,7 +4914,9 @@ struct ScreenLayoutEditor: View {
                         .offset(x: frame.minX, y: frame.minY)
                     ForEach(Array(screens.enumerated()), id: \.offset) { si, screen in
                         ForEach(Array(screen.zones.enumerated()), id: \.offset) { zi, zone in
-                            if shown.indices.contains(si), shown[si] || chosenZone(si, zi) { zoneView(si, zi, zone, image: image, frame: frame) }
+                            if shown.indices.contains(si), shown[si] || chosenZone(si, zi), !hidden.contains(zone) {
+                                zoneView(si, zi, zone, image: image, frame: frame)
+                            }
                         }
                     }
                     // Over the copies: a copy can cover the whole screen.
@@ -5052,8 +5058,21 @@ struct ScreenLayoutEditor: View {
             badgeOn: screen.anchored && here) { sel = .screen(si) }
         ForEach(screen.zones.indices, id: \.self) { zi in
             let zone = screen.zones[zi]
-            row(icon: "square.stack", title: name(zone: zi, in: si), indent: 1, chosen: sel == .zone(si, zi), dim: !here,
-                badge: zone.parts.count == 1 ? "1 part" : "\(zone.parts.count) parts", badgeOn: false) { sel = .zone(si, zi) }
+            let off = hidden.contains(zone)
+            HStack(spacing: 2) {
+                row(icon: "square.stack", title: name(zone: zi, in: si), indent: 1, chosen: sel == .zone(si, zi), dim: !here || off,
+                    badge: zone.parts.count == 1 ? "1 part" : "\(zone.parts.count) parts", badgeOn: false) {
+                    hidden.removeAll { $0 == zone }; sel = .zone(si, zi)
+                }
+                Button(off ? "Show zone" : "Hide zone", systemImage: off ? "eye.slash" : "eye") {
+                    if off { hidden.removeAll { $0 == zone } } else {
+                        hidden.append(zone)
+                        if chosenZone(si, zi) { sel = .screen(si) }
+                    }
+                }
+                .labelStyle(.iconOnly).buttonStyle(.plain).foregroundStyle(off ? Color.secondary : Color.primary)
+                .frame(width: 26, height: 26).contentShape(Rectangle())
+            }
             if chosenZone(si, zi), zone.parts.count > 1 {
                 ForEach(zone.parts.indices, id: \.self) { pi in
                     row(icon: "square.dashed", title: "Part \(pi + 1)", indent: 2, chosen: sel == .part(si, zi, pi), dim: !here,
