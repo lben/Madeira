@@ -3307,6 +3307,8 @@ struct ControllerBindsPage: View {
     /// The game, for the AI prompt (Mapping as text).
     var game = ""
     var appID: Int?
+    /// The request field needs a key window; the Session menu's window never is one.
+    var requestField = true
     @State private var request = ""
     @State private var textNote: String?
 
@@ -3344,7 +3346,9 @@ struct ControllerBindsPage: View {
             }
         }
         Section {
-            TextField("What you want, e.g. like the console edition", text: $request, axis: .vertical)
+            if requestField {
+                TextField("What you want, e.g. like the console edition", text: $request, axis: .vertical)
+            }
             Button("Copy prompt for an AI", systemImage: "doc.on.doc") {
                 UIPasteboard.general.string = PadMappingText.prompt(game: game, appID: appID, request: request, current: currentText)
                 textNote = "Prompt copied. Paste it into an AI chat, copy the mapping it answers with, then tap Paste."
@@ -4131,7 +4135,8 @@ struct LibraryHUD: View {
                                                            set: { model.padMouseVertical = $0 ?? 1; model.saveCurrentProfile() }),
                                     controls: controls.controls,
                                     game: model.entries.first { $0.id == model.current }?.title ?? "",
-                                    appID: model.entries.first { $0.id == model.current }?.steamAppID)
+                                    appID: model.entries.first { $0.id == model.current }?.steamAppID,
+                                    requestField: false)
             }.scrollContentBackground(.hidden)
         }
     }

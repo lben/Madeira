@@ -132,6 +132,8 @@ A: Left Click
 B: right click — cancel
 X: Spacebar (pause)
 LB: 2
+Y:   # unused
+Select: -
 Guide: Escape
 LT: wheel up
 RS: nothing
@@ -141,10 +143,12 @@ Enjoy!
 """
 let pasted = PadMappingText.parse(answer)
 assert(pasted.binds == ["LS": .stickMouse, "RS": .stickCustom, "RS←": .key(0x51), "RS→": .key(0x45), "RS↑": .key(0x21),
-                        "RS↓": .key(0x22), "A": .mouseLeft, "B": .mouseRight, "X": .key(0x20), "LB": .key(0x32)], "\(pasted.binds)")
+                        "RS↓": .key(0x22), "A": .mouseLeft, "B": .mouseRight, "X": .key(0x20), "LB": .key(0x32),
+                        "View": .key(0xBD)], "\(pasted.binds)")
 assert(pasted.mouseVertical == 1.2)
-assert(pasted.problems.count == 3 && pasted.problems[0].contains("Guide") && pasted.problems[1].contains("wheel up")
-       && pasted.problems[2].contains("nothing"), "\(pasted.problems)")
+// An empty action is reported, not read as the minus key (which "-" still is).
+assert(pasted.problems.count == 4 && pasted.problems[0].contains("Y cannot be") && pasted.problems[1].contains("Guide")
+       && pasted.problems[2].contains("wheel up") && pasted.problems[3].contains("nothing"), "\(pasted.problems)")
 assert(PadMappingText.parse("hello").binds.isEmpty)
 
 // The prompt carries the game, the player's request, the format and the mapping now.

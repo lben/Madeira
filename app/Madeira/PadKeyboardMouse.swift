@@ -331,10 +331,10 @@ enum PadMappingText {
     /// Other spellings an answer may use, after `norm`.
     private static let keyAliases: [String: Int32] = [
         "esc": 0x1B, "control": 0x11, "leftctrl": 0x11, "lctrl": 0x11, "leftshift": 0x10, "lshift": 0x10,
-        "leftalt": 0x12, "lalt": 0x12, "return": 0x0D, "spacebar": 0x20, "pgup": 0x21, "pageup": 0x21,
-        "pgdn": 0x22, "pgdown": 0x22, "pagedown": 0x22, "uparrow": 0x26, "arrowup": 0x26,
+        "leftalt": 0x12, "lalt": 0x12, "return": 0x0D, "spacebar": 0x20, "pgup": 0x21,
+        "pgdn": 0x22, "pgdown": 0x22, "uparrow": 0x26, "arrowup": 0x26,
         "downarrow": 0x28, "arrowdown": 0x28, "leftarrow": 0x25, "arrowleft": 0x25,
-        "rightarrow": 0x27, "arrowright": 0x27, "del": 0x2E, "ins": 0x2D, "capslock": 0x14,
+        "rightarrow": 0x27, "arrowright": 0x27, "del": 0x2E, "ins": 0x2D,
         "minus": 0xBD, "equals": 0xBB, "comma": 0xBC, "period": 0xBE, "slash": 0xBF,
         "backslash": 0xDC, "semicolon": 0xBA, "apostrophe": 0xDE, "grave": 0xC0, "backtick": 0xC0, "tilde": 0xC0,
     ]
@@ -342,13 +342,18 @@ enum PadMappingText {
         "leftbumper": "LB", "rightbumper": "RB", "lefttrigger": "LT", "righttrigger": "RT",
         "l1": "LB", "r1": "RB", "l2": "LT", "r2": "RT",
         "leftstickclick": "L3", "rightstickclick": "R3", "lsclick": "L3", "rsclick": "R3",
-        "menu": "Menu", "options": "Menu", "view": "View", "back": "View", "share": "View",
+        "options": "Menu", "back": "View", "share": "View",
         "leftstick": "LS", "rightstick": "RS",
     ]
 
     /// Lower case, without spaces, hyphens or underscores: "D-pad Up" -> "dpadup".
     static func norm(_ s: String) -> String {
         s.lowercased().filter { !" -_".contains($0) }
+    }
+    /// For key names: as `norm` but keeping hyphens, so "-" and "Numpad -" stay
+    /// themselves instead of becoming "" and "numpad".
+    static func keyNorm(_ s: String) -> String {
+        s.lowercased().filter { !" _".contains($0) }
     }
 
     static func keyName(_ vk: Int32) -> String? { keys.first { $0.1 == vk }?.0 }
@@ -384,7 +389,8 @@ enum PadMappingText {
     }
     /// What a button or stick direction row's text means; nil if unknown.
     static func buttonAction(_ text: String) -> ControlAction? {
-        let n = norm(text)
+        let n = norm(text), k = keyNorm(text)
+        guard !k.isEmpty else { return nil }   // "Y:" with nothing after it is not the minus key
         switch n {
         case "leftclick", "click", "lmb", "leftmouse", "mouseleft": return .mouseLeft
         case "rightclick", "rmb", "rightmouse", "mouseright": return .mouseRight
@@ -393,8 +399,8 @@ enum PadMappingText {
         case "showkeyboard", "keyboard": return .keyboardToggle
         default: break
         }
-        if let k = keys.first(where: { norm($0.0) == n }) { return .key(k.1) }
-        if let vk = keyAliases[n] { return .key(vk) }
+        if let key = keys.first(where: { keyNorm($0.0) == k }) { return .key(key.1) }
+        if !n.isEmpty, let vk = keyAliases[n] { return .key(vk) }
         return nil
     }
 
@@ -432,7 +438,7 @@ enum PadMappingText {
         return lines.joined(separator: "\n")
     }
 
-    struct Parsed: Equatable {
+    struct Parsed {
         var binds: [String: ControlAction] = [:]
         var mouseVertical: Double?
         var problems: [String] = []
@@ -457,7 +463,7 @@ enum PadMappingText {
             for cut in [" (", " //", " —", " – "] { if let r = right.range(of: cut) { right = String(right[..<r.lowerBound]) } }
             right = right.trimmingCharacters(in: .whitespaces)
             switch norm(left) {
-            case "mode", "game", "controller": continue
+            case "mode", "game": continue
             case "verticalspeed":
                 if let v = Double(right.filter { $0.isNumber || $0 == "." }), v > 0 {
                     p.mouseVertical = min(max(right.contains("%") || v > 3 ? v / 100 : v, 0.25), 1.5)
