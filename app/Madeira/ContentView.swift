@@ -385,7 +385,15 @@ final class MetalBackedView: UIView {
     private func tmAbsoluteClick(down: UInt32, up: UInt32, at p: CGPoint) {
         let (x, y) = mapPoint(p)
         winios_pointer(x, y, down | F_ABS, 0)
-        winios_pointer(x, y, up | F_ABS, 0)
+        Self.afterTapHold { winios_pointer(x, y, up | F_ABS, 0) }
+    }
+
+    /// How long a tap holds its button. Down and up in the same instant is a click
+    /// a game reading the mouse once a frame (DirectInput's device state, Frostpunk)
+    /// can miss; 70 ms spans two frames at 30 fps.
+    static let tapHold: TimeInterval = 0.07
+    static func afterTapHold(_ release: @escaping () -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + tapHold, execute: release)
     }
 
     private func touchModeBegan(_ touches: Set<UITouch>) {
@@ -465,7 +473,7 @@ final class MetalBackedView: UIView {
         case 1:
             let (x, y) = mapPoint(mid)
             winios_post_touch_down(x, y)
-            winios_post_touch_up(x, y)
+            Self.afterTapHold { winios_post_touch_up(x, y) }
         case 2: tmAbsoluteClick(down: F_RDOWN, up: F_RUP, at: mid)
         case 3: tmAbsoluteClick(down: F_MDOWN, up: F_MUP, at: mid)
         default: break
@@ -801,7 +809,7 @@ final class MetalBackedView: UIView {
                 if !twoFingerMoved && now - twoFingerStartTime < 0.40
                     && !InputSettings.shared.relative {   // ml643: see touchesBegan
                     postPointer(F_RDOWN)
-                    postPointer(F_RUP)
+                    Self.afterTapHold { [weak self] in guard let self else { return }; self.postPointer(self.F_RUP) }
                 }
                 twoFingerActive = false
             }
@@ -825,7 +833,7 @@ final class MetalBackedView: UIView {
         if !movedBeyondSlop && now - touchStartTime < 0.5 && !InputSettings.shared.relative {
             fputs("[trackpad] ended: click\n", stderr)
             postPointer(F_LDOWN)
-            postPointer(F_LUP)
+            Self.afterTapHold { [weak self] in guard let self else { return }; self.postPointer(self.F_LUP) }
         }
     }
 
@@ -3792,6 +3800,11 @@ enum ControlAction: Codable, Equatable, Hashable {
     case joystickArrows      // renders as a stick, posts the arrow keys
     case keyboardToggle      // raises the iOS keyboard, as in portrait
     case pad(String)         // ml1930: touch gamepad action, preserving saved layout names.
+    case mouseMiddle
+    // Keyboard-and-mouse controller mode (PadKeyboardMouse) only: what a controller
+    // stick does. The right stick's `.none` still means the mouse, as saved before these.
+    case stickMouse          // the stick moves the mouse
+    case stickCustom         // the stick presses its four direction binds ("RS↑" ...)
 
     /// The four keys a stick drives, up/right/down/left. nil for non-sticks.
     var stickKeys: [Int32]? {
@@ -3869,6 +3882,9 @@ enum ControlAction: Codable, Equatable, Hashable {
         case .none:            return "—"
         case .mouseLeft:       return "L"
         case .mouseRight:      return "R"
+        case .mouseMiddle:     return "M"
+        case .stickMouse:      return "Mouse"
+        case .stickCustom:     return "Keys"
         case .keyboardToggle:  return "⌨"
         case .joystickWASD:    return "WASD"
         case .joystickArrows:  return "↕"
@@ -4541,9 +4557,11 @@ struct TouchControlButton: View {
             winios_pointer(0, 0, down ? 0x0002 : 0x0004, 0)   // LEFTDOWN / LEFTUP
         case .mouseRight:
             winios_pointer(0, 0, down ? 0x0008 : 0x0010, 0)   // RIGHTDOWN / RIGHTUP
+        case .mouseMiddle:
+            winios_pointer(0, 0, down ? 0x0020 : 0x0040, 0)   // MIDDLEDOWN / MIDDLEUP
         case .keyboardToggle:
             if down { MetalBackedView.toggleKeyboard() }
-        case .none, .joystickWASD, .joystickArrows:
+        case .none, .joystickWASD, .joystickArrows, .stickMouse, .stickCustom:
             break                                              // sticks drive themselves
         case .pad:
             break     // TouchPadSurface owns pad presses and cancellation.

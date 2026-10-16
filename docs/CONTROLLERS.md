@@ -135,10 +135,12 @@ Input does this for desktop players; Madeira Dock runs Valve's client headless,
 so Madeira does it itself (`PadKeyboardMouse.swift`). The default, **Game's own
 support**, is XInput as before.
 
-In keyboard-and-mouse mode the physical pad is not published to XInput at all
-(the game sees no controller; touch controller mappings still connect player 1),
-and every pad input becomes what the touch controls already produce, through
-the same posting paths:
+In keyboard-and-mouse mode neither the physical pad nor the touch controller is
+published to XInput (the game sees player 1 at most connected at rest, while the
+touch controller connects it): both go through the same table, merged as for
+XInput, so the on-screen controller plays the game as the physical one does.
+Every input becomes what the touch controls already produce, through the same
+posting paths:
 
 | Pad input | Default |
 | --- | --- |
@@ -151,13 +153,19 @@ the same posting paths:
 | Start, Select | Escape, Tab |
 
 The game's **Controller binds** page (the Session menu while the mode is on, and
-Game details) lists every input with a menu of what it does: a mouse button, a
-key, Show keyboard or Nothing; the sticks choose between WASD, the arrow keys
-and (right stick) the mouse. Rows the player has not changed show the layout's
+Game details) lists every input with a menu of what it does: a mouse button
+(left, right or middle), a key, Show keyboard or Nothing. Each stick is the
+mouse, WASD, the arrow keys or **Custom keys** (the left stick may also do
+nothing): custom keys add four rows, Up, Right, Down and Left, each with the
+same menu as a button (`"RS↑"`, `"RS→"`, `"RS↓"`, `"RS←"` in the table), which
+start from the keys the stick drives by default. A diagonal holds both of its
+directions. Frostpunk, say, turns its camera with Q/E and zooms with Page
+Up/Down: the right stick's Left/Right on Q/E and Up/Down on Page Up/Down, with
+the left stick as the mouse. Rows the player has not changed show the layout's
 or the template's action and are not stored; "Default" in a row's menu and
 the page's Reset clear them. The table is saved with the game
 (`LibraryEntry.controllerBinds`) and the driver takes each change at once.
-While the right stick is the mouse, the page also has its **Vertical speed**
+While a stick is the mouse, the page also has its **Vertical speed**
 (`LibraryEntry.padMouseVertical`, 25–150 % of the horizontal speed): games
 scale the camera's pitch and yaw differently from a mouse, and a stick cannot
 be compensated by hand the way a wrist does.

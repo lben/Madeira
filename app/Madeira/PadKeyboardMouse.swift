@@ -22,6 +22,11 @@ import UIKit
 ///   the left stick, mouse on the right stick, the triggers as the mouse
 ///   buttons, the D-pad as the arrow keys, Start as Escape, Select as Tab.
 ///
+/// A stick can also move the mouse (either stick) or press four keys of the
+/// player's choice (`.stickCustom`: the table's "LS↑" "LS→" "LS↓" "LS←" rows,
+/// likewise for RS), say Q/E to turn a camera and Page Up/Down to zoom it.
+/// The touch controller's sticks and buttons go through the same table.
+///
 /// The mode is a per-game choice (LibraryEntry.controllerMode, Game details and
 /// the Session menu), off by default: a game with native controller support
 /// keeps XInput, as before. MADEIRA_PAD_KBM=0 removes the choice.
@@ -29,6 +34,13 @@ struct PadBindings: Equatable {
     static let buttonNames = ["A", "B", "X", "Y", "LB", "RB", "LT", "RT", "L3", "R3",
                               "Menu", "View", "D↑", "D↓", "D←", "D→"]
     static let stickNames = ["LS", "RS"]
+    /// A custom key stick's directions, up/right/down/left: "LS↑" ... "RS←".
+    static let directionArrows = ["↑", "→", "↓", "←"]
+    static func directionNames(_ stick: String) -> [String] { directionArrows.map { stick + $0 } }
+    /// What each stick may be set to; `.none` is nothing on LS and the mouse on RS.
+    static func isStickChoice(_ a: ControlAction) -> Bool {
+        a.stickKeys != nil || a == .stickMouse || a == .stickCustom
+    }
 
     /// What each digital input does; the triggers count as digital here.
     var buttons: [String: ControlAction]
@@ -37,6 +49,8 @@ struct PadBindings: Equatable {
     var leftStick: ControlAction
     /// The right stick moves the mouse (default) or drives a key stick.
     var rightStick: ControlAction
+    /// What a `.stickCustom` stick's directions do, up/right/down/left, by stick.
+    var stickDirections: [String: [ControlAction]] = Self.templateDirections
     /// Vertical speed of the right-stick mouse relative to its horizontal speed
     /// (1 = the same). Games scale pitch and yaw differently from a mouse, and a
     /// stick cannot be compensated by hand the way a wrist does.
@@ -59,6 +73,11 @@ struct PadBindings: Equatable {
                   "D↑": .key(0x26), "D↓": .key(0x28), "D←": .key(0x25), "D→": .key(0x27)],
         leftStick: .joystickWASD,
         rightStick: .none)                    // .none on the right stick means: the mouse
+    /// A stick just switched to custom keys starts with the keys it drove by default.
+    static let templateDirections: [String: [ControlAction]] = [
+        "LS": [.key(0x57), .key(0x44), .key(0x53), .key(0x41)],   // W D S A
+        "RS": [.key(0x26), .key(0x27), .key(0x28), .key(0x25)],   // the arrow keys
+    ]
 
     /// The template with the layout's own bindings on top, then the game's binds
     /// table on top of that. A binding replaces the template's entry for that
@@ -78,11 +97,21 @@ struct PadBindings: Equatable {
             }
         }
         for (name, action) in binds ?? [:] where !action.isPad {
-            if name == "LS" { b.leftStick = action.stickKeys != nil ? action : .none }
-            else if name == "RS" { b.rightStick = action.stickKeys != nil ? action : .none }
-            else if buttonNames.contains(name), action.stickKeys == nil { b.buttons[name] = action }
+            if name == "LS" { b.leftStick = isStickChoice(action) ? action : .none }
+            else if name == "RS" { b.rightStick = isStickChoice(action) ? action : .none }
+            else if isStickChoice(action) { continue }
+            else if buttonNames.contains(name) { b.buttons[name] = action }
+            else if let (stick, i) = direction(name) { b.stickDirections[stick]?[i] = action }
         }
         return b
+    }
+
+    /// "RS→" -> ("RS", 1); nil for any other name.
+    static func direction(_ name: String) -> (String, Int)? {
+        for stick in stickNames {
+            if let i = directionNames(stick).firstIndex(of: name) { return (stick, i) }
+        }
+        return nil
     }
 
     /// What the template gives an input, for the binds page's "Default" rows.
@@ -90,7 +119,9 @@ struct PadBindings: Equatable {
         switch name {
         case "LS": return template.leftStick
         case "RS": return template.rightStick
-        default:   return template.buttons[name] ?? .none
+        default:
+            if let (stick, i) = direction(name) { return templateDirections[stick]?[i] ?? .none }
+            return template.buttons[name] ?? .none
         }
     }
 
@@ -99,7 +130,16 @@ struct PadBindings: Equatable {
         name == "Menu" ? "Start" : name == "View" ? "Select" : name
     }
 
-    var usesMouseStick: Bool { rightStick.stickKeys == nil }
+    /// The four actions a stick presses, up/right/down/left; nil when it moves the mouse or does nothing.
+    func stickActions(_ stick: String) -> [ControlAction]? {
+        let mode = stick == "LS" ? leftStick : rightStick
+        if mode == .stickCustom { return stickDirections[stick] }
+        return mode.stickKeys?.map { .key($0) }
+    }
+    /// Whether a stick moves the mouse.
+    func stickMovesMouse(_ stick: String) -> Bool {
+        stick == "LS" ? leftStick == .stickMouse : (rightStick == .none || rightStick == .stickMouse)
+    }
 }
 
 /// Turns pad samples into key and mouse events. Fed from GamepadInput's sampling
@@ -118,8 +158,6 @@ final class PadKeyboardMouse {
     private static let stickDeadzone = 0.35
 
     private var held: Set<String> = []            // digital inputs currently down
-    private var leftDir = -1, rightDir = -1        // 8-way sectors of the key sticks
-    private var leftKeys: [Int32] = [], rightKeys: [Int32] = []
     private var lastSample: UInt64 = 0             // mach time of the previous feed
     private var carry = MotionCarry()
     private var mouseMoving = false
@@ -145,16 +183,18 @@ final class PadKeyboardMouse {
         held = down
 
         let l = Self.unit(lx, ly), r = Self.unit(rx, ry)
-        if let keys = bindings.leftStick.stickKeys {
-            leftDir = Self.applyStick(from: leftDir, to: Self.sector(l.x, l.y), keys: keys, heldKeys: &leftKeys)
+        applyStick("LS", sector: Self.sector(l.x, l.y), actions: bindings.stickActions("LS"))
+        applyStick("RS", sector: Self.sector(r.x, r.y), actions: bindings.stickActions("RS"))
+        // The mouse follows the stick that moves it; with both, the one pushed further.
+        var m = (x: 0.0, y: 0.0)
+        for (stick, s) in [("LS", l), ("RS", r)] where bindings.stickMovesMouse(stick) {
+            if s.x * s.x + s.y * s.y > m.x * m.x + m.y * m.y { m = s }
         }
-        if let keys = bindings.rightStick.stickKeys {
-            rightDir = Self.applyStick(from: rightDir, to: Self.sector(r.x, r.y), keys: keys, heldKeys: &rightKeys)
-        } else if focused {
+        if focused, bindings.stickMovesMouse("LS") || bindings.stickMovesMouse("RS") {
             // Motion by the time since the last sample, unfloored: samples come from
             // the 4 ms timer and from every controller change, so StickVelocity.frame's
             // 1/240 s floor would make the cursor faster the more often the pad reports.
-            let v = StickVelocity.deflect(r.x, r.y)
+            let v = StickVelocity.deflect(m.x, m.y)
             let k = InputSettings.shared.sensRel * StickVelocity.fullRate * min(dt, 1.0 / 15.0)
             let f = (dx: v.x * k, dy: -v.y * k)
             if f.dx != 0 || f.dy != 0 {
@@ -174,7 +214,7 @@ final class PadKeyboardMouse {
     }
 
     /// Whether a key or mouse button is down, or the mouse is moving.
-    var holding: Bool { !pressedWith.isEmpty || !leftKeys.isEmpty || !rightKeys.isEmpty || mouseMoving }
+    var holding: Bool { !pressedWith.isEmpty || mouseMoving }
 
     /// Release everything this driver holds: the mode went off, the app
     /// resigned active, the session ended, the library took the pad, or the
@@ -183,10 +223,6 @@ final class PadKeyboardMouse {
         for (_, a) in pressedWith { act(a, down: false) }
         pressedWith.removeAll()
         held.removeAll()
-        for vk in leftKeys { winios_post_key(vk, 0) }
-        for vk in rightKeys { winios_post_key(vk, 0) }
-        leftKeys.removeAll(); rightKeys.removeAll()
-        leftDir = -1; rightDir = -1
         lastSample = 0
         carry.reset()
         mouseMoving = false
@@ -194,7 +230,8 @@ final class PadKeyboardMouse {
     }
 
     /// Each input is released through the action it was pressed with, so a layout
-    /// edit during a hold cannot leave a key down.
+    /// edit during a hold cannot leave a key down. Keyed by input name: buttons
+    /// ("A") and held stick directions ("LS↑").
     private var pressedWith: [String: ControlAction] = [:]
     private func act(_ action: ControlAction, down: Bool) {
         switch action {
@@ -204,9 +241,11 @@ final class PadKeyboardMouse {
             winios_pointer(0, 0, down ? 0x0002 : 0x0004, 0)   // LEFTDOWN / LEFTUP
         case .mouseRight:
             winios_pointer(0, 0, down ? 0x0008 : 0x0010, 0)   // RIGHTDOWN / RIGHTUP
+        case .mouseMiddle:
+            winios_pointer(0, 0, down ? 0x0020 : 0x0040, 0)   // MIDDLEDOWN / MIDDLEUP
         case .keyboardToggle:
             if down { DispatchQueue.main.async { MetalBackedView.toggleKeyboard() } }
-        case .none, .joystickWASD, .joystickArrows, .pad:
+        case .none, .joystickWASD, .joystickArrows, .stickMouse, .stickCustom, .pad:
             break                                              // sticks are handled by sector; pad actions are XInput's
         }
     }
@@ -223,28 +262,31 @@ final class PadKeyboardMouse {
         if a < 0 { a += 360 }
         return Int((a + 22.5) / 45.0) % 8
     }
-    static func sectorKeys(_ d: Int, _ q: [Int32]) -> [Int32] {
+    /// The directions (0 up, 1 right, 2 down, 3 left) a sector holds: one, or two on a diagonal.
+    static func sectorDirections(_ d: Int) -> [Int] {
         switch d {
-        case 0: return [q[0]]
-        case 1: return [q[0], q[1]]
-        case 2: return [q[1]]
-        case 3: return [q[2], q[1]]
-        case 4: return [q[2]]
-        case 5: return [q[2], q[3]]
-        case 6: return [q[3]]
-        case 7: return [q[0], q[3]]
+        case 0: return [0]
+        case 1: return [0, 1]
+        case 2: return [1]
+        case 3: return [2, 1]
+        case 4: return [2]
+        case 5: return [2, 3]
+        case 6: return [3]
+        case 7: return [0, 3]
         default: return []
         }
     }
     /// Release what is no longer held and press what newly is, so a held
     /// direction does not stutter while the thumb wanders inside one sector.
-    private static func applyStick(from: Int, to: Int, keys q: [Int32], heldKeys: inout [Int32]) -> Int {
-        guard to != from else { return from }
-        let old = Set(heldKeys), new = Set(sectorKeys(to, q))
-        for vk in old.subtracting(new) { winios_post_key(vk, 0) }
-        for vk in new.subtracting(old) { winios_post_key(vk, 1) }
-        heldKeys = Array(new)
-        return to
+    /// `actions` nil (the stick moves the mouse or does nothing) holds none.
+    private func applyStick(_ stick: String, sector: Int, actions: [ControlAction]?) {
+        let names = PadBindings.directionNames(stick)
+        let new = Set((actions == nil ? [] : Self.sectorDirections(sector)).map { names[$0] })
+        let old = Set(names.filter { pressedWith[$0] != nil })
+        for name in old.subtracting(new) { if let a = pressedWith.removeValue(forKey: name) { act(a, down: false) } }
+        for name in new.subtracting(old) {
+            if let i = names.firstIndex(of: name), let a = actions?[i] { pressedWith[name] = a; act(a, down: true) }
+        }
     }
 
     private static let timebase: Double = {

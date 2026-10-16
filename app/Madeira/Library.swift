@@ -3317,9 +3317,16 @@ struct ControllerBindsPage: View {
             Section(group.0) {
                 ForEach(group.1, id: \.self) { name in row(name) }
             }
+            if group.0 == "Sticks" {
+                ForEach(PadBindings.stickNames.filter { effective($0) == .stickCustom }, id: \.self) { stick in
+                    Section(stick == "LS" ? "Left stick keys" : "Right stick keys") {
+                        ForEach(PadBindings.directionNames(stick), id: \.self) { name in row(name) }
+                    }
+                }
+            }
         }
-        if effective("RS").stickKeys == nil {
-            Section("Right stick as mouse") {
+        if PadBindings.stickNames.contains(where: { stickMovesMouse($0) }) {
+            Section("Stick as mouse") {
                 LabeledContent("Vertical speed") {
                     HStack {
                         Slider(value: Binding(get: { mouseVertical ?? 1 }, set: { mouseVertical = abs($0 - 1) < 0.01 ? nil : $0 }), in: 0.25...1.5, step: 0.05)
@@ -3333,7 +3340,7 @@ struct ControllerBindsPage: View {
         Section {
             Button("Reset all to defaults", role: .destructive) { reset() }
                 .disabled(!changed)
-            Text("Defaults: left stick WASD, right stick mouse, RT and LT click, D-pad arrows, A Space, B Ctrl, X E, Y R, LB Q, RB F, L3 Shift, R3 C, Start Esc, Select Tab. A touch control's own controller binding (control editor) applies when a row is at its default.")
+            Text("Defaults: left stick WASD, right stick mouse, RT and LT click, D-pad arrows, A Space, B Ctrl, X E, Y R, LB Q, RB F, L3 Shift, R3 C, Start Esc, Select Tab. Custom keys gives a stick one key per direction. The touch controller follows this table too. A touch control's own controller binding (control editor) applies when a row is at its default.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
@@ -3345,21 +3352,29 @@ struct ControllerBindsPage: View {
     /// What the input does in this session: the table's entry, else the layout's, else the template's.
     private func effective(_ name: String) -> ControlAction {
         let fromLayout = PadBindings.build(controls: controls)
+        if let (stick, i) = PadBindings.direction(name) { return binds?[name] ?? fromLayout.stickDirections[stick]?[i] ?? .none }
         return binds?[name] ?? (name == "LS" ? fromLayout.leftStick : name == "RS" ? fromLayout.rightStick : fromLayout.buttons[name] ?? .none)
+    }
+    private func stickMovesMouse(_ stick: String) -> Bool {
+        let mode = effective(stick)
+        return stick == "LS" ? mode == .stickMouse : (mode == .none || mode == .stickMouse)
     }
 
     private func row(_ name: String) -> some View {
         let effective = effective(name)
         let changed = binds?[name] != nil
-        return LabeledContent(PadBindings.displayName(name)) {
+        return LabeledContent(Self.rowTitle(name)) {
             Menu {
                 if name == "LS" || name == "RS" {
-                    pick(name, name == "RS" ? "Mouse" : "Nothing", .none)
+                    pick(name, "Mouse", name == "RS" ? .none : .stickMouse)
                     pick(name, "WASD", .joystickWASD)
                     pick(name, "Arrow keys", .joystickArrows)
+                    pick(name, "Custom keys", .stickCustom)
+                    if name == "LS" { pick(name, "Nothing", .none) }
                 } else {
                     pick(name, "Left click", .mouseLeft)
                     pick(name, "Right click", .mouseRight)
+                    pick(name, "Middle click", .mouseMiddle)
                     Menu("Letters") { ForEach(0x41...0x5A, id: \.self) { vk in pick(name, String(UnicodeScalar(UInt8(vk))), .key(Int32(vk))) } }
                     Menu("Numbers") { ForEach(0x30...0x39, id: \.self) { vk in pick(name, String(UnicodeScalar(UInt8(vk))), .key(Int32(vk))) } }
                     Menu("Function keys") { ForEach(0...11, id: \.self) { i in pick(name, "F\(i + 1)", .key(Int32(0x70 + i))) } }
@@ -3409,12 +3424,21 @@ struct ControllerBindsPage: View {
         }
     }
 
+    /// A row's label: the input's name; a custom stick's directions by direction.
+    static func rowTitle(_ name: String) -> String {
+        if let (_, i) = PadBindings.direction(name) { return ["Up", "Right", "Down", "Left"][i] }
+        return PadBindings.displayName(name)
+    }
+
     /// Row text for an action, in the words the menu uses.
     static func describe(_ action: ControlAction, input: String) -> String {
         switch action {
         case .none:            return input == "RS" ? "Mouse" : "Nothing"
         case .mouseLeft:       return "Left click"
         case .mouseRight:      return "Right click"
+        case .mouseMiddle:     return "Middle click"
+        case .stickMouse:      return "Mouse"
+        case .stickCustom:     return "Custom keys"
         case .joystickWASD:    return "WASD"
         case .joystickArrows:  return "Arrow keys"
         case .keyboardToggle:  return "Show keyboard"
