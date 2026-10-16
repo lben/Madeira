@@ -385,7 +385,8 @@ final class MetalBackedView: UIView {
     private func tmAbsoluteClick(down: UInt32, up: UInt32, at p: CGPoint) {
         let (x, y) = mapPoint(p)
         winios_pointer(x, y, down | F_ABS, 0)
-        Self.afterTapHold { winios_pointer(x, y, up | F_ABS, 0) }
+        let release = up | F_ABS
+        Self.afterTapHold { winios_pointer(x, y, release, 0) }
     }
 
     /// How long a tap holds its button. Down and up in the same instant is a click
