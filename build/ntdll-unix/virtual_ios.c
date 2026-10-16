@@ -2102,6 +2102,48 @@ static uintptr_t ios_jumbo_holdback_carve( size_t size )
 }
 
 
+/* JUMBO FIRST FIT: the lowest free hole at or above `from` that holds `size`
+ * (64K-aligned start), from the kernel's own map; 0 if there is none below the
+ * task's ceiling.
+ *
+ * WHY: Gears Tactics reserves ten pools, 40 GB of the 63 GB map. In the one run
+ * that got past them, its seventh (1 GB) took the hole the sixth left at
+ * 0xaf0000000; in six that died the kernel put it above the game image instead,
+ * the tenth (1 GB) then found no room, and the game crashed writing through the
+ * NULL it got back -- with exactly that 1 GB hole still free at 0xaf0000000
+ * ([va-gaps] at the failure). Placing a failed jumbo reserve in a hole that the
+ * map shows free can only help: without it the request fails. */
+static uintptr_t ios_jumbo_first_fit( size_t size, uintptr_t from )
+{
+    mach_vm_address_t addr = 0, prev_end = 0;
+    unsigned long long ceiling = 0;
+    task_vm_info_data_t vmi;
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+
+    if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt ) == KERN_SUCCESS)
+        ceiling = (unsigned long long)vmi.max_address;
+    if (!ceiling) ceiling = 0x1000000000ull;
+    for (;;)
+    {
+        mach_vm_size_t rsize = 0;
+        natural_t depth = 0;
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t c2 = VM_REGION_SUBMAP_INFO_COUNT_64;
+        mach_vm_address_t hole_end;
+        uintptr_t start;
+
+        if (mach_vm_region_recurse( mach_task_self(), &addr, &rsize, &depth,
+                                    (vm_region_recurse_info_t)&info, &c2 ) != KERN_SUCCESS || addr > ceiling)
+            addr = ceiling;                   /* the tail up to the ceiling is the last hole */
+        hole_end = addr;
+        start = ((uintptr_t)(prev_end > from ? prev_end : from) + 0xffff) & ~(uintptr_t)0xffff;
+        if (start < hole_end && hole_end - start >= size) return start;
+        if (addr >= ceiling) return 0;
+        prev_end = addr + rsize;
+        addr = prev_end;
+    }
+}
+
 static void ios_va_occupancy_probe( const char *why )
 {
     const mach_vm_address_t LIMIT = 0x1000000000ULL;   /* 64G, the carveout floor */
@@ -21937,6 +21979,29 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                             *size_ptr = csz;
                             return STATUS_SUCCESS;
                         }
+                    }
+                }
+                /* JUMBO FIRST FIT (see ios_jumbo_first_fit): every hole the map shows
+                 * free, lowest first, above __PAGEZERO. */
+                {
+                    uintptr_t from = 0x100000000, at;
+                    int tries = 0;
+
+                    while (tries++ < 16 && (at = ios_jumbo_first_fit( *size_ptr, from )))
+                    {
+                        void *pick3 = (void *)at;
+                        SIZE_T fsz = *size_ptr;
+                        unsigned int st4 = allocate_virtual_memory( &pick3, &fsz, type, protect, 0, 0, 0, 0 );
+
+                        dprintf( 2, "[jumbo] first-fit hole 0x%llx size=0x%lx -> %p st=0x%x\n",
+                                 (unsigned long long)at, (unsigned long)*size_ptr, pick3, st4 );
+                        if (!st4)
+                        {
+                            *ret = pick3;
+                            *size_ptr = fsz;
+                            return STATUS_SUCCESS;
+                        }
+                        from = at + 0x10000;
                     }
                 }
                 if (probed++ < 2)
