@@ -87,7 +87,9 @@ final class MetalHostView: UIView {
 /// them (the previous behaviour), "0" never does, and by default they are not
 /// sent while the landscape overlay shows at least one controller mapping,
 /// unless touch is set to work as a trackpad. A hardware mouse or trackpad is
-/// not affected.
+/// not affected. While they are held back, a finger held still for a second on the
+/// game unlocks them (the screen is then the mouse again) until a controller button
+/// is pressed, so a menu the controller cannot reach stays usable.
 @MainActor enum TouchMouseGate {
     enum Mode: String { case auto, on, off }
     static let mode: Mode = {
@@ -98,14 +100,31 @@ final class MetalHostView: UIView {
         return m
     }()
     /// Set by TouchControlsOverlay.configureGamepad: the landscape overlay is
-    /// visible, not editing, and has at least one controller mapping.
-    static var padOverlay = false
+    /// visible, not editing, and has at least one controller mapping. Its going
+    /// away ends a long press's unlock, so the next overlay holds touches back again.
+    static var padOverlay = false { didSet { if !padOverlay { unlocked = false } } }
+    /// A long press let touches through; a controller button (touch or physical) takes it back.
+    private(set) static var unlocked = false
     static func suppressing(touchpad: Bool) -> Bool {
         switch mode {
         case .on: return false
         case .off: return true
-        case .auto: return padOverlay && !touchpad
+        case .auto: return padOverlay && !touchpad && !unlocked
         }
+    }
+    static func unlock() {
+        // Only the auto hold-back can be lifted; with "0" touches never reach the program.
+        guard mode == .auto, padOverlay, !unlocked else { return }
+        unlocked = true
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        LogStore.shared.log("[touch-mouse] on: long press (a controller button turns it off)")
+        Toast.show("Touch mouse on · a controller button turns it off")
+    }
+    static func relock() {
+        guard unlocked else { return }
+        unlocked = false
+        LogStore.shared.log("[touch-mouse] off: controller button")
+        Toast.show("Touch mouse off")
     }
 }
 
@@ -571,6 +590,9 @@ final class MetalBackedView: UIView {
     // Direct touches that began while TouchMouseGate was suppressing stay
     // swallowed until they lift, so a change of the gate never leaves a button held.
     private var tmgSwallowed: Set<ObjectIdentifier> = []
+    /// A swallowed finger that may become the long press unlocking touches (TouchMouseGate).
+    private var tmgHold: (touch: ObjectIdentifier, start: CGPoint, generation: Int)?
+    private var tmgHoldGeneration = 0
     /// Returns the touches that should still be handled (nil = nothing left).
     private func tmgFilter(_ touches: Set<UITouch>, _ phase: UITouch.Phase) -> Set<UITouch>? {
         if phase == .began {
@@ -579,12 +601,29 @@ final class MetalBackedView: UIView {
             let direct = touches.filter { $0.type == .direct }
             guard !direct.isEmpty else { return touches }
             for t in direct { tmgSwallowed.insert(ObjectIdentifier(t)) }
+            if tmgHold == nil, tmgSwallowed.count == 1, let t = direct.first {
+                tmgHoldGeneration += 1
+                let generation = tmgHoldGeneration
+                tmgHold = (ObjectIdentifier(t), t.location(in: self), generation)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                    guard let self, let hold = self.tmgHold, hold.generation == generation,
+                          self.tmgSwallowed.contains(hold.touch) else { return }
+                    self.tmgHold = nil
+                    TouchMouseGate.unlock()
+                }
+            } else if tmgSwallowed.count > 1 {
+                tmgHold = nil                      // a second finger (a pinch): not a long press
+            }
             let rest = touches.subtracting(direct)
             return rest.isEmpty ? nil : rest
         }
         guard !tmgSwallowed.isEmpty else { return touches }
         let mine = touches.filter { tmgSwallowed.contains(ObjectIdentifier($0)) }
         guard !mine.isEmpty else { return touches }
+        if let hold = tmgHold, let t = mine.first(where: { ObjectIdentifier($0) == hold.touch }),
+           phase != .moved || hypot(t.location(in: self).x - hold.start.x, t.location(in: self).y - hold.start.y) > 20 {
+            tmgHold = nil                          // lifted or moved: not a long press
+        }
         if phase == .ended || phase == .cancelled {
             for t in mine { tmgSwallowed.remove(ObjectIdentifier(t)) }
         }
@@ -4543,14 +4582,14 @@ struct TouchControlButton: View {
         let old = Set(stickKeys(stickDir, q)), new = Set(stickKeys(next, q))
         for vk in old.subtracting(new) { winios_post_key(vk, 0) }
         for vk in new.subtracting(old) { winios_post_key(vk, 1) }
-        if stickDir == -1, next != -1 { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
+        if stickDir == -1, next != -1 { UIImpactFeedbackGenerator(style: .light).impactOccurred(); TouchMouseGate.relock() }
         stickDir = next
     }
 
     /// Haptic on the DOWN edge only — a held movement key would otherwise buzz
     /// continuously for as long as you walk.
     private func press(_ down: Bool) {
-        if down { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
+        if down { UIImpactFeedbackGenerator(style: .light).impactOccurred(); TouchMouseGate.relock() }
         switch control.action {
         case .key(let vk):
             winios_post_key(vk, down ? 1 : 0)

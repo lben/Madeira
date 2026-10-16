@@ -148,6 +148,7 @@ final class GamepadInput: @unchecked Sendable {
 
     @MainActor func touch(owner: UUID, control: UUID, value: GamepadSample?) {
         guard Self.touchEnabled else { return }
+        if value != nil { TouchMouseGate.relock() }   // a touch control in use takes the screen back
         queue.async { [self] in
             guard active || value == nil else { return }
             touchState.update(owner: owner, control: control, value: value)
@@ -199,6 +200,7 @@ final class GamepadInput: @unchecked Sendable {
     private var hidBattery: (level: UInt8, charging: UInt8) = (UInt8(WINIOS_HIDPAD_BATTERY_UNKNOWN), 0)
     private var hidBatteryCountdown = 0
     private var touchState = TouchGamepadState()
+    private var physicalButtons = [UInt16](repeating: 0, count: 4)   // the last sample's, per slot
     @MainActor private var observers: [NSObjectProtocol] = []
     @MainActor private var started = false
 
@@ -342,6 +344,9 @@ final class GamepadInput: @unchecked Sendable {
                     (pad.buttonB, 0x2000), (pad.buttonX, 0x4000), (pad.buttonY, 0x8000)
                 ]
                 for (button, mask) in buttons where button?.isPressed == true { state.buttons |= mask }
+                // A button newly down takes back touches a long press let through (TouchMouseGate).
+                if state.buttons & ~physicalButtons[i] != 0 { DispatchQueue.main.async { TouchMouseGate.relock() } }
+                physicalButtons[i] = state.buttons
                 state.left_trigger = Self.trigger(pad.leftTrigger.value)
                 state.right_trigger = Self.trigger(pad.rightTrigger.value)
                 state.lx = Self.axis(pad.leftThumbstick.xAxis.value)

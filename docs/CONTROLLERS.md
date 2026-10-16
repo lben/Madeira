@@ -55,8 +55,13 @@ While such a layout shows at least one controller mapping, a touch on the game
 view that misses every control is not sent to the program as a mouse. Some
 games (Dark Souls Remastered) switch to keyboard and mouse prompts on any mouse
 event and then ignore the controller. Touch used as a
-trackpad and a hardware mouse are not affected. `env.MADEIRA_TOUCH_MOUSE = 1`
-always sends such touches, as before; `0` never does.
+trackpad and a hardware mouse are not affected. A finger held still on the game
+for a second turns the touch mouse on (a vibration and "Touch mouse on"): touches
+then reach the program as a mouse again, for a menu the controller cannot work,
+until any controller button is pressed, on screen or on a physical pad ("Touch
+mouse off"), or the on-screen controller goes away (the Session menu included).
+A second finger (a pinch) is never a long press. `env.MADEIRA_TOUCH_MOUSE = 1` always sends such touches, as before;
+`0` never does.
 
 ## Layouts
 
