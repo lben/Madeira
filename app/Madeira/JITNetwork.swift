@@ -227,7 +227,7 @@ enum JITShortcutFile {
     /// The "done" input owed since a "start" (see above); nil when none. Kept on disk, so
     /// a run that ends between them (Madeira closed or crashed) is put back at the next
     /// launch. Main thread.
-    private static let pendingKey = "madeiraJITShortcutPendingDone"
+    nonisolated private static let pendingKey = "madeiraJITShortcutPendingDone"
     private var pending: String? {
         get { UserDefaults.standard.string(forKey: Self.pendingKey) }
         set { UserDefaults.standard.set(newValue, forKey: Self.pendingKey) }
@@ -270,8 +270,11 @@ enum JITShortcutFile {
 
     /// From the launch thread, right after the debugger detached: runs "done" if
     /// needed and blocks until Madeira is back (or `timeout` passes). Nothing draws
-    /// yet at that point, so the moment in the background is safe.
-    nonisolated static func restoreBlocking(timeout: TimeInterval = 30) {
+    /// yet at that point, so the moment in the background is safe. Returns whether that
+    /// "done" turned Cellular Data back on.
+    @discardableResult
+    nonisolated static func restoreBlocking(timeout: TimeInterval = 30) -> Bool {
+        let cellular = UserDefaults.standard.string(forKey: pendingKey)?.contains("cellular") == true
         let finished = DispatchSemaphore(value: 0)
         DispatchQueue.main.async {
             MainActor.assumeIsolated { shared.restoreIfNeeded { finished.signal() } }
@@ -279,6 +282,7 @@ enum JITShortcutFile {
         if finished.wait(timeout: .now() + timeout) == .timedOut {
             LogStore.shared.log("[jit-shortcut] done did not return within \(Int(timeout)) s; continuing", level: .error)
         }
+        return cellular
     }
 
     private func run(_ input: String, completion: @escaping (Outcome) -> Void) {

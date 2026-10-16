@@ -563,6 +563,20 @@ enum DockOffline {
         SteamLog.event("[dock-offline] enabled=\(enabled ? 1 : 0) network=\(networkDown ? "down" : "up") request=\(offline ? 1 : 0) account-saved=\(accountSaved != nil ? 1 : 0) game-started-online=\(verified(appID) != nil ? 1 : 0)")
     }
 
+    /// The Madeira JIT shortcut turns Cellular Data off for JIT and back on just before
+    /// Wine starts (JITNetwork.swift), so configure() saw no network and asked for an
+    /// offline logon. On the launch thread, right after that: waits up to `seconds` for
+    /// the path to return and, when it does, lets Valve's client log on online.
+    static func networkBackAfterJIT(within seconds: TimeInterval = 10) {
+        guard getenv("MADEIRA_DOCK_OFFLINE") != nil else { return }
+        let t0 = CFAbsoluteTimeGetCurrent()
+        while networkDown, CFAbsoluteTimeGetCurrent() - t0 < seconds { usleep(100_000) }
+        let down = networkDown
+        if !down { unsetenv("MADEIRA_DOCK_OFFLINE") }
+        SteamLog.event(String(format: "[dock-offline] after the JIT shortcut: network=%@ after %.1f s request=%d",
+                              down ? "down" : "up", CFAbsoluteTimeGetCurrent() - t0, down ? 1 : 0))
+    }
+
     /// Follows the host's report (MadeiraDockModel.watchReport): an online start
     /// in which Valve's client confirmed the licence and reported that it can log
     /// the account on offline saves the game for offline play.

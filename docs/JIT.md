@@ -168,7 +168,10 @@ shortcut** is on (`env.MADEIRA_JIT_SHORTCUT = 1`), Madeira runs your
   VPN was on), disconnect LocalDevVPN; with "vpn-restore", connect the kept VPN
   again (it replaces LocalDevVPN). Neither VPN word when LocalDevVPN was already
   connected. Madeira runs it once a game's JIT pool is mapped and the debugger
-  has detached, before Wine starts, or at once if enabling JIT fails.
+  has detached, before Wine starts, or at once if enabling JIT fails. After a
+  "done cellular", a Dock start that was set up with no network (cellular data
+  was off for JIT) waits up to 10 s for the network to return and then logs on
+  online (`[dock-offline] after the JIT shortcut: …`).
 
 The shortcut keeps the VPN with **Store Content** (iOS 27): only that keeps a
 VPN that **Set VPN** accepts. Saved as text (to a file, or as a name Madeira

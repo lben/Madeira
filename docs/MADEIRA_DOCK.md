@@ -198,7 +198,9 @@ about ownership.
   for the host, which hands over the sign-in as usual, asks Valve's client whether
   it can log on offline, and only then asks it to. The client answers the license
   question from what it cached and starts the game through the same launch call.
-  A network that fails after the start falls back the same way 20 s in.
+  A network that fails after the start falls back the same way 20 s in. When the
+  Madeira JIT shortcut turned cellular data off for JIT (docs/JIT.md), Madeira waits
+  up to 10 s for it to return before Wine starts, and starts online if it does.
 - **Game details** shows a small line under the title for games the Dock starts:
   "Can be played offline" (green check) once the account is saved; "Start a game
   online to play offline" before that; and "Start once online to play offline" for

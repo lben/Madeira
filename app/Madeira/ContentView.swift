@@ -3288,7 +3288,8 @@ struct ContentView: View {
             // for this JIT (JITNetwork.swift). The pool is mapped and the debugger is
             // gone, so put them back now: running the shortcut leaves Madeira for a
             // moment, which is safe only before Wine starts drawing.
-            JITNetworkShortcut.restoreBlocking()
+            // Turning Cellular Data back on: the Dock's start was set up while it was off.
+            if JITNetworkShortcut.restoreBlocking() { DockOffline.networkBackAfterJIT() }
 
             // Step 2: Start wineserver
             self.startWineserver()
