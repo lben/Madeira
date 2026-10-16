@@ -150,6 +150,9 @@ assert(pasted.mouseVertical == 1.2)
 assert(pasted.problems.count == 4 && pasted.problems[0].contains("Y cannot be") && pasted.problems[1].contains("Guide")
        && pasted.problems[2].contains("wheel up") && pasted.problems[3].contains("nothing"), "\(pasted.problems)")
 assert(PadMappingText.parse("hello").binds.isEmpty)
+// Hyphens inside key names are read too.
+assert(PadMappingText.parse("RS up: Page-Up\nL3: Caps-Lock\nR3: Numpad-5\nLB: F-1").binds
+       == ["RS↑": .key(0x21), "L3": .key(0x14), "R3": .key(0x65), "LB": .key(0x70)])
 
 // The prompt carries the game, the player's request, the format and the mapping now.
 let prompt = PadMappingText.prompt(game: "Frostpunk", appID: 323190, request: "like the console edition", current: fpText)

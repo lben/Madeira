@@ -400,7 +400,10 @@ enum PadMappingText {
         default: break
         }
         if let key = keys.first(where: { keyNorm($0.0) == k }) { return .key(key.1) }
-        if !n.isEmpty, let vk = keyAliases[n] { return .key(vk) }
+        guard !n.isEmpty else { return nil }
+        // Hyphens inside a name ("Page-Up", "Numpad-5"), for every name that has no "-" of its own.
+        if let key = keys.first(where: { !$0.0.contains("-") && norm($0.0) == n }) { return .key(key.1) }
+        if let vk = keyAliases[n] { return .key(vk) }
         return nil
     }
 

@@ -178,7 +178,8 @@ written by any AI chat, kept or shared:
 
 - **Copy prompt for an AI** copies a prompt with the game's name and Steam app
   ID, what the player typed above it ("like the console edition", "like the most
-  popular Steam Deck layout", ...), how Madeira maps a controller, the answer
+  popular Steam Deck layout", ...; the field is in Game details only, as the
+  Session menu cannot take typing), how Madeira maps a controller, the answer
   format and the game's mapping now. The AI is asked to look up the PC controls,
   the console layout and the popular Steam Deck layouts first.
 - **Paste** replaces the table with the copied text. A whole answer can be
