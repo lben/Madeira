@@ -3136,16 +3136,10 @@ struct LibraryDetail: View {
                     Toggle("Touch controls", isOn: $entry.touchControls)
                     if GamepadInput.keyboardMouseAvailable {
                         ControllerModeChoice(mode: $entry.controllerMode)
-                        if entry.controllerMode == "keys" {
-                            NavigationLink("Controller binds") {
-                                Form { ControllerBindsPage(binds: $entry.controllerBinds, mouseVertical: $entry.padMouseVertical,
-                                                           game: entry.title, appID: entry.steamAppID) }
-                                    .navigationTitle("Controller binds")
-                                    .toolbar {
-                                        Button("Reset") { entry.controllerBinds = nil; entry.padMouseVertical = nil }
-                                            .disabled(entry.controllerBinds == nil && entry.padMouseVertical == nil)
-                                    }
-                            }
+                        NavigationLink("Controller binds") {
+                            Form { ControllerBindsPage(binds: $entry.controllerBinds, mouseVertical: $entry.padMouseVertical,
+                                                       game: entry.title, appID: entry.steamAppID, mode: $entry.controllerMode) }
+                                .navigationTitle("Controller binds")
                         }
                     }
                     LabeledContent("Control opacity") {
@@ -3309,8 +3303,11 @@ struct ControllerBindsPage: View {
     var appID: Int?
     /// The request field needs a key window; the Session menu's window never is one.
     var requestField = true
+    /// The game's Controller choice: the binds apply only to "keys", and a paste turns it on.
+    var mode: Binding<String?>?
     @State private var request = ""
     @State private var textNote: String?
+    @State private var hasBackup = false
 
     private static let groups: [(String, [String])] = [
         ("Sticks", ["LS", "RS"]),
@@ -3321,6 +3318,13 @@ struct ControllerBindsPage: View {
     ]
 
     var body: some View {
+        if let mode, mode.wrappedValue != "keys" {
+            Section {
+                Button("Use Keyboard and mouse", systemImage: "keyboard") { mode.wrappedValue = "keys" }
+            } footer: {
+                Text("These binds apply only when Controller is Keyboard and mouse.")
+            }
+        }
         ForEach(Self.groups, id: \.0) { group in
             Section(group.0) {
                 ForEach(group.1, id: \.self) { name in row(name) }
@@ -3352,6 +3356,7 @@ struct ControllerBindsPage: View {
             Button("Copy prompt for an AI", systemImage: "doc.on.doc") {
                 UIPasteboard.general.string = PadMappingText.prompt(game: game, appID: appID, request: request, current: currentText)
                 textNote = "Prompt copied. Paste it into an AI chat, copy the mapping it answers with, then tap Paste."
+                Toast.show("Prompt copied")
             }
             PasteButton(payloadType: String.self) { strings in
                 DispatchQueue.main.async { paste(strings.first ?? "") }
@@ -3359,16 +3364,40 @@ struct ControllerBindsPage: View {
             Button("Copy mapping", systemImage: "square.and.arrow.up") {
                 UIPasteboard.general.string = currentText
                 textNote = "Mapping copied."
+                Toast.show("Mapping copied")
             }
         } header: { Text("Mapping as text") } footer: {
-            Text(textNote ?? "Have any AI chat write this game's mapping: Copy prompt for an AI gives it the game, how Madeira maps a controller and the format to answer in. Paste replaces this table with a copied mapping; inputs it leaves out return to their defaults.")
+            Text(textNote ?? "Have any AI chat write this game's mapping: Copy prompt for an AI gives it the game, how Madeira maps a controller and the format to answer in. Paste replaces this table with a copied mapping; inputs it leaves out return to their defaults. The mapping before a Paste or Reset is kept: Restore previous mapping brings it back.")
         }
         Section {
-            Button("Reset all to defaults", role: .destructive) { reset() }
+            if hasBackup {
+                Button("Restore previous mapping", systemImage: "arrow.uturn.backward") { restore() }
+            }
+            Button("Reset all to defaults", role: .destructive) { keepBackup(); reset(); Toast.show("Defaults restored") }
                 .disabled(!changed)
             Text("Defaults: left stick WASD, right stick mouse, RT and LT click, D-pad arrows, A Space, B Ctrl, X E, Y R, LB Q, RB F, L3 Shift, R3 C, Start Esc, Select Tab. Custom keys gives a stick one key per direction. The touch controller follows this table too. A touch control's own controller binding (control editor) applies when a row is at its default.")
                 .font(.caption).foregroundStyle(.secondary)
         }
+        .onAppear { hasBackup = UserDefaults.standard.data(forKey: backupKey) != nil }
+    }
+
+    /// The table before the last Paste or Reset, per game (UserDefaults), so either can be undone.
+    private struct Backup: Codable { var binds: [String: ControlAction]?; var mouseVertical: Double? }
+    private var backupKey: String { "madeiraBindsBackup." + (appID.map(String.init) ?? game) }
+    private func keepBackup() {
+        guard let data = try? JSONEncoder().encode(Backup(binds: binds, mouseVertical: mouseVertical)) else { return }
+        UserDefaults.standard.set(data, forKey: backupKey)
+        hasBackup = true
+    }
+    private func restore() {
+        guard let data = UserDefaults.standard.data(forKey: backupKey),
+              let b = try? JSONDecoder().decode(Backup.self, from: data) else { return }
+        UserDefaults.standard.removeObject(forKey: backupKey)
+        hasBackup = false
+        binds = b.binds
+        mouseVertical = b.mouseVertical
+        textNote = "Previous mapping restored."
+        Toast.show("Previous mapping restored")
     }
 
     /// Anything to reset: a bound row or a vertical speed other than 1.
@@ -3384,12 +3413,16 @@ struct ControllerBindsPage: View {
         let parsed = PadMappingText.parse(text)
         guard !parsed.binds.isEmpty || parsed.mouseVertical != nil else {
             textNote = "Nothing pasted: \(parsed.problems.first ?? "the clipboard has no mapping")."
+            Toast.show("Nothing pasted")
             return
         }
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        keepBackup()
         binds = parsed.binds.isEmpty ? nil : parsed.binds
         mouseVertical = parsed.mouseVertical
+        if let mode, mode.wrappedValue != "keys" { mode.wrappedValue = "keys" }
         textNote = "Pasted \(parsed.binds.count) rows." + (parsed.problems.isEmpty ? "" : " Ignored: " + parsed.problems.joined(separator: "; ") + ".")
+        Toast.show(parsed.problems.isEmpty ? "Mapping pasted" : "Mapping pasted, \(parsed.problems.count) line\(parsed.problems.count == 1 ? "" : "s") skipped")
     }
 
     /// What the input does in this session: the table's entry, else the layout's, else the template's.
@@ -3579,6 +3612,59 @@ struct ControllerModeChoice: View {
                 Text("Keyboard and mouse").tag("keys")
             }.pickerStyle(.menu).labelsHidden()
         }
+    }
+}
+
+/// A short confirmation after an action ("Prompt copied"). Its own window, above the
+/// controls window (the Session menu) and never touchable or key, so it shows in Game
+/// details and in a session alike and never takes a touch from the game.
+@MainActor final class Toast: ObservableObject {
+    static let shared = Toast()
+    @Published private(set) var text: String?
+    private var window: UIWindow?
+    private var hide: DispatchWorkItem?
+
+    static func show(_ text: String) { shared.show(text) }
+    func show(_ text: String) {
+        let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive })
+        if window == nil, let scene {
+            let w = UIWindow(windowScene: scene)
+            w.windowLevel = .normal + 300
+            w.backgroundColor = .clear
+            w.isUserInteractionEnabled = false
+            let host = UIHostingController(rootView: ToastView())
+            host.view.backgroundColor = .clear
+            w.rootViewController = host
+            w.isHidden = false
+            window = w
+        }
+        // The screen may have rotated since the window was made.
+        if let scene { window?.frame = scene.coordinateSpace.bounds }
+        withAnimation(.easeOut(duration: 0.2)) { self.text = text }
+        hide?.cancel()
+        let item = DispatchWorkItem { [weak self] in withAnimation(.easeIn(duration: 0.3)) { self?.text = nil } }
+        hide = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8, execute: item)
+    }
+}
+
+private struct ToastView: View {
+    @ObservedObject private var toast = Toast.shared
+    var body: some View {
+        VStack {
+            Spacer()
+            if let text = toast.text {
+                Text(text)
+                    .font(.callout.weight(.semibold))
+                    .padding(.horizontal, 18).padding(.vertical, 10)
+                    .background(.regularMaterial, in: Capsule())
+                    .padding(.bottom, 36)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .allowsHitTesting(false)
     }
 }
 
@@ -4124,8 +4210,6 @@ struct LibraryHUD: View {
                 Spacer()
                 Text("Controller binds").font(.headline)
                 Spacer()
-                Button("Reset") { model.controllerBinds = [:]; model.padMouseVertical = 1; model.saveCurrentProfile() }
-                    .buttonStyle(.borderless).disabled(model.controllerBinds.isEmpty && model.padMouseVertical == 1)
                 Button("Done") { model.menu = false }.buttonStyle(.bordered)
             }.padding(.horizontal, 22).padding(.top, 22).padding(.bottom, 8)
             Form {
@@ -4136,7 +4220,8 @@ struct LibraryHUD: View {
                                     controls: controls.controls,
                                     game: model.entries.first { $0.id == model.current }?.title ?? "",
                                     appID: model.entries.first { $0.id == model.current }?.steamAppID,
-                                    requestField: false)
+                                    requestField: false,
+                                    mode: Binding(get: { model.controllerMode }, set: { model.controllerMode = $0; model.saveCurrentProfile() }))
             }.scrollContentBackground(.hidden)
         }
     }
@@ -4160,9 +4245,8 @@ struct LibraryHUD: View {
                 Button("Edit controls", systemImage: "slider.horizontal.3") { controls.visible = true; controls.editing = true; model.menu = false }
                 if GamepadInput.keyboardMouseAvailable {
                     ControllerModeChoice(mode: Binding(get: { model.controllerMode }, set: { model.controllerMode = $0; model.saveCurrentProfile() }))
-                    if model.controllerMode == "keys" {
-                        Button("Controller binds", systemImage: "gamecontroller") { bindsPage = true }
-                    } else if model.controllerMode == "dinput" {
+                    Button("Controller binds", systemImage: "gamecontroller") { bindsPage = true }
+                    if model.controllerMode == "dinput" {
                         // ml1240: the DirectInput device exists only from the launch on.
                         Text("XInput and DirectInput applies to the next launch.")
                             .font(.caption).foregroundStyle(.secondary)

@@ -152,8 +152,8 @@ posting paths:
 | LB, RB, L3, R3 | Q, F, Shift, C |
 | Start, Select | Escape, Tab |
 
-The game's **Controller binds** page (the Session menu while the mode is on, and
-Game details) lists every input with a menu of what it does: a mouse button
+The game's **Controller binds** page (Game details, and the Session menu) lists
+every input with a menu of what it does: a mouse button
 (left, right or middle), a key, Show keyboard or Nothing. Each stick is the
 mouse, WASD, the arrow keys or **Custom keys** (the left stick may also do
 nothing): custom keys add four rows, Up, Right, Down and Left, each with the
@@ -186,6 +186,11 @@ written by any AI chat, kept or shared:
   pasted: when it has a code block, only the block is read. Lines it cannot read
   are listed and skipped; inputs it leaves out return to their defaults.
 - **Copy mapping** copies the mapping in effect.
+- The table before the last Paste or **Reset all to defaults** is kept per game:
+  **Restore previous mapping** brings it back. A Paste also switches the game's
+  Controller to Keyboard and mouse, and the page says so when another choice is
+  active (the binds apply only in that mode). Each action confirms itself with a
+  short notice at the bottom of the screen.
 
 The format, one `input: action` per line, `#` starting a comment:
 
