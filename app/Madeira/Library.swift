@@ -227,7 +227,7 @@ struct LibraryEntry: Codable, Identifiable {
     /// .none), on top of the layout's bindings and the built-in template. Only
     /// inputs the player changed are stored. Optional, so older files decode.
     var controllerBinds: [String: ControlAction]?
-    /// Keyboard-and-mouse mode: vertical speed of the right-stick mouse relative
+    /// Keyboard-and-mouse mode: vertical speed of the stick mouse relative
     /// to horizontal (PadBindings.mouseVertical); nil = 1.
     var padMouseVertical: Double?
     /// Processors reported to Windows code in this game's sessions
@@ -621,7 +621,7 @@ final class LibraryModel: ObservableObject {
     @Published var controllerBinds: [String: ControlAction] = [:] {
         didSet { if oldValue != controllerBinds { applyControllerMode() } }
     }
-    /// The session's right-stick mouse vertical speed (LibraryEntry.padMouseVertical).
+    /// The session's stick mouse vertical speed (LibraryEntry.padMouseVertical).
     @Published var padMouseVertical: Double = 1 {
         didSet { if oldValue != padMouseVertical { applyControllerMode() } }
     }
@@ -3138,7 +3138,8 @@ struct LibraryDetail: View {
                         ControllerModeChoice(mode: $entry.controllerMode)
                         if entry.controllerMode == "keys" {
                             NavigationLink("Controller binds") {
-                                Form { ControllerBindsPage(binds: $entry.controllerBinds, mouseVertical: $entry.padMouseVertical) }
+                                Form { ControllerBindsPage(binds: $entry.controllerBinds, mouseVertical: $entry.padMouseVertical,
+                                                           game: entry.title, appID: entry.steamAppID) }
                                     .navigationTitle("Controller binds")
                                     .toolbar {
                                         Button("Reset") { entry.controllerBinds = nil; entry.padMouseVertical = nil }
@@ -3298,11 +3299,16 @@ struct SteamSearchView: View {
 /// has not changed show the layout's or the template's action and are not stored.
 struct ControllerBindsPage: View {
     @Binding var binds: [String: ControlAction]?
-    /// Vertical speed of the right-stick mouse, 1 = as horizontal; nil = 1.
+    /// Vertical speed of the stick mouse, 1 = as horizontal; nil = 1.
     @Binding var mouseVertical: Double?
     /// The active layout's own bindings, so an unchanged row shows what really
     /// happens in this session; Game details passes none.
     var controls: [TouchControl] = []
+    /// The game, for the AI prompt (Mapping as text).
+    var game = ""
+    var appID: Int?
+    @State private var request = ""
+    @State private var textNote: String?
 
     private static let groups: [(String, [String])] = [
         ("Sticks", ["LS", "RS"]),
@@ -3338,6 +3344,22 @@ struct ControllerBindsPage: View {
             }
         }
         Section {
+            TextField("What you want, e.g. like the console edition", text: $request, axis: .vertical)
+            Button("Copy prompt for an AI", systemImage: "doc.on.doc") {
+                UIPasteboard.general.string = PadMappingText.prompt(game: game, appID: appID, request: request, current: currentText)
+                textNote = "Prompt copied. Paste it into an AI chat, copy the mapping it answers with, then tap Paste."
+            }
+            PasteButton(payloadType: String.self) { strings in
+                DispatchQueue.main.async { paste(strings.first ?? "") }
+            }
+            Button("Copy mapping", systemImage: "square.and.arrow.up") {
+                UIPasteboard.general.string = currentText
+                textNote = "Mapping copied."
+            }
+        } header: { Text("Mapping as text") } footer: {
+            Text(textNote ?? "Have any AI chat write this game's mapping: Copy prompt for an AI gives it the game, how Madeira maps a controller and the format to answer in. Paste replaces this table with a copied mapping; inputs it leaves out return to their defaults.")
+        }
+        Section {
             Button("Reset all to defaults", role: .destructive) { reset() }
                 .disabled(!changed)
             Text("Defaults: left stick WASD, right stick mouse, RT and LT click, D-pad arrows, A Space, B Ctrl, X E, Y R, LB Q, RB F, L3 Shift, R3 C, Start Esc, Select Tab. Custom keys gives a stick one key per direction. The touch controller follows this table too. A touch control's own controller binding (control editor) applies when a row is at its default.")
@@ -3349,6 +3371,23 @@ struct ControllerBindsPage: View {
     var changed: Bool { !(binds ?? [:]).isEmpty || mouseVertical != nil }
     func reset() { binds = nil; mouseVertical = nil }
 
+    /// The mapping in effect, as PadMappingText writes it.
+    private var currentText: String {
+        PadMappingText.text(PadBindings.build(controls: controls, binds: binds, mouseVertical: mouseVertical), game: game)
+    }
+    /// A pasted mapping replaces the table; lines it cannot read are listed, and nothing changes when none could be.
+    private func paste(_ text: String) {
+        let parsed = PadMappingText.parse(text)
+        guard !parsed.binds.isEmpty || parsed.mouseVertical != nil else {
+            textNote = "Nothing pasted: \(parsed.problems.first ?? "the clipboard has no mapping")."
+            return
+        }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        binds = parsed.binds.isEmpty ? nil : parsed.binds
+        mouseVertical = parsed.mouseVertical
+        textNote = "Pasted \(parsed.binds.count) rows." + (parsed.problems.isEmpty ? "" : " Ignored: " + parsed.problems.joined(separator: "; ") + ".")
+    }
+
     /// What the input does in this session: the table's entry, else the layout's, else the template's.
     private func effective(_ name: String) -> ControlAction {
         let fromLayout = PadBindings.build(controls: controls)
@@ -3356,8 +3395,7 @@ struct ControllerBindsPage: View {
         return binds?[name] ?? (name == "LS" ? fromLayout.leftStick : name == "RS" ? fromLayout.rightStick : fromLayout.buttons[name] ?? .none)
     }
     private func stickMovesMouse(_ stick: String) -> Bool {
-        let mode = effective(stick)
-        return stick == "LS" ? mode == .stickMouse : (mode == .none || mode == .stickMouse)
+        PadBindings.build(controls: controls, binds: binds).stickMovesMouse(stick)
     }
 
     private func row(_ name: String) -> some View {
@@ -4091,7 +4129,9 @@ struct LibraryHUD: View {
                                                    set: { model.controllerBinds = $0 ?? [:]; model.saveCurrentProfile() }),
                                     mouseVertical: Binding(get: { model.padMouseVertical == 1 ? nil : model.padMouseVertical },
                                                            set: { model.padMouseVertical = $0 ?? 1; model.saveCurrentProfile() }),
-                                    controls: controls.controls)
+                                    controls: controls.controls,
+                                    game: model.entries.first { $0.id == model.current }?.title ?? "",
+                                    appID: model.entries.first { $0.id == model.current }?.steamAppID)
             }.scrollContentBackground(.hidden)
         }
     }

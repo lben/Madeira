@@ -327,6 +327,7 @@ final class GamepadInput: @unchecked Sendable {
             // ml2100: the pad whose HID-only inputs (touchpad click) this sample
             // carries; nil while the app is inactive or the library owns input.
             var hidLive: GCExtendedGamepad?
+            var libraryOwnsInput = false
             // Keep the connected identity, but release all controls while the
             // app is inactive. A delayed callback cannot republish a held key.
             if active, let pad {
@@ -353,7 +354,8 @@ final class GamepadInput: @unchecked Sendable {
                 if i == 0 {
                     let library = LibraryController.shared
                     library.sample(buttons: state.buttons, lx: state.lx, ly: state.ly)
-                    if library.ownsInput {
+                    libraryOwnsInput = library.ownsInput
+                    if libraryOwnsInput {
                         state = winios_gamepad()
                         state.connected = 1
                         hidLive = nil
@@ -365,14 +367,13 @@ final class GamepadInput: @unchecked Sendable {
             // for XInput) becomes keys and mouse motion. XInput sees player 1 only at
             // rest, and only while the touch controller connects it; the HID
             // controller, when on, likewise stays but gets none of the input.
-            if i == 0, active, let kbm = keyboardMouse, !(pad != nil && LibraryController.shared.ownsInput) {
+            if i == 0, active, let kbm = keyboardMouse, !libraryOwnsInput {
                 var input = GamepadSample(buttons: state.buttons, lt: state.left_trigger, rt: state.right_trigger,
                                           lx: state.lx, ly: state.ly, rx: state.rx, ry: state.ry)
                 if touchConnected { input = GamepadSample.merge(physical: input, touch: touchState.sample) }
                 PadKeyboardMouse.shared.feed(buttons: input.buttons, lt: input.lt, rt: input.rt,
                                              lx: input.lx, ly: input.ly, rx: input.rx, ry: input.ry,
                                              bindings: kbm, focused: HardwareInput.shared.baseFocused)
-                hidLive = nil
                 guard touchConnected else {
                     winios_gamepad_set_state(Int32(i), nil)
                     if hid { winios_hidpad_set_state(nil) }

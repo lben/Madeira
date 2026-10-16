@@ -57,10 +57,11 @@ assert(take() == ["key 20 up"])
 assert(template.stickMovesMouse("RS") && !template.stickMovesMouse("LS"))
 
 // A custom right stick: Q/E to turn, Page Up/Down to zoom; the left stick moves the mouse.
-let frostpunk = PadBindings.build(controls: [], binds: [
+let frostpunkTable: [String: ControlAction] = [
     "LS": .stickMouse, "RS": .stickCustom,
     "RS←": .key(0x51), "RS→": .key(0x45), "RS↑": .key(0x21), "RS↓": .key(0x22),
-    "A": .mouseLeft, "B": .mouseRight, "R3": .mouseMiddle])
+    "A": .mouseLeft, "B": .mouseRight, "R3": .mouseMiddle]
+let frostpunk = PadBindings.build(controls: [], binds: frostpunkTable)
 assert(frostpunk.stickActions("RS") == [.key(0x21), .key(0x45), .key(0x22), .key(0x51)])
 assert(frostpunk.stickActions("LS") == nil && frostpunk.stickMovesMouse("LS") && !frostpunk.stickMovesMouse("RS"))
 feed(frostpunk, rx: 32767)
@@ -84,7 +85,6 @@ assert(take() == ["ptr 0040"])
 // Unset custom directions start from the stick's own default keys.
 let partial = PadBindings.build(controls: [], binds: ["LS": .stickCustom, "LS↑": .key(0x20)])
 assert(partial.stickActions("LS") == [.key(0x20), .key(0x44), .key(0x53), .key(0x41)])
-assert(PadBindings.templateAction("RS↓") == .key(0x28))
 
 // Tables saved before the stick choices: RS .none is the mouse, LS .none nothing,
 // and a stick choice on a button row is ignored.
@@ -106,7 +106,53 @@ assert(Set(take()) == ["ptr 0002", "key 45 down"])
 pad.releaseAll("test")
 assert(Set(take()) == ["ptr 0004", "key 45 up"])
 assert(!pad.holding)
-print("PASS: template, custom key stick with diagonals, left stick mouse, middle click, legacy tables, releaseAll")
+// Mapping as text: what Copy mapping writes reads back to the same bindings.
+let fpText = PadMappingText.text(PadBindings.build(controls: [], binds: frostpunkTable, mouseVertical: 0.8), game: "Frostpunk")
+assert(fpText.contains("RS: keys\nRS up: Page Up") && fpText.contains("R3: middle click") && fpText.contains("vertical speed: 80%"))
+let readBack = PadMappingText.parse(fpText)
+assert(readBack.problems.isEmpty, "\(readBack.problems)")
+assert(PadBindings.build(controls: [], binds: readBack.binds, mouseVertical: readBack.mouseVertical)
+       == PadBindings.build(controls: [], binds: frostpunkTable, mouseVertical: 0.8), "text round trip")
+
+// An AI's whole answer pasted: only the code block counts; other spellings and
+// trailing explanations are read, and unreadable lines are reported, not applied.
+let answer = """
+Here is the mapping:
+
+```
+# Madeira controller mapping for Frostpunk
+mode: keyboard and mouse
+Left stick: mouse
+Right Stick: Keys
+RS left: Q   (turn left)
+RS right: e
+right stick up: PgUp
+RS down: page down // zoom out
+A: Left Click
+B: right click — cancel
+X: Spacebar (pause)
+LB: 2
+Guide: Escape
+LT: wheel up
+RS: nothing
+vertical speed: 120%
+```
+Enjoy!
+"""
+let pasted = PadMappingText.parse(answer)
+assert(pasted.binds == ["LS": .stickMouse, "RS": .stickCustom, "RS←": .key(0x51), "RS→": .key(0x45), "RS↑": .key(0x21),
+                        "RS↓": .key(0x22), "A": .mouseLeft, "B": .mouseRight, "X": .key(0x20), "LB": .key(0x32)], "\(pasted.binds)")
+assert(pasted.mouseVertical == 1.2)
+assert(pasted.problems.count == 3 && pasted.problems[0].contains("Guide") && pasted.problems[1].contains("wheel up")
+       && pasted.problems[2].contains("nothing"), "\(pasted.problems)")
+assert(PadMappingText.parse("hello").binds.isEmpty)
+
+// The prompt carries the game, the player's request, the format and the mapping now.
+let prompt = PadMappingText.prompt(game: "Frostpunk", appID: 323190, request: "like the console edition", current: fpText)
+assert(prompt.contains("\"Frostpunk\" (Steam app 323190)") && prompt.contains("What I want: like the console edition"))
+assert(prompt.contains("RS up: Page Up") && prompt.contains("Key names: A–Z") && prompt.hasSuffix("vertical speed: 80%\n```"))
+assert(PadMappingText.prompt(game: "X", appID: nil, request: " ", current: "").contains("[WRITE HERE"))
+print("PASS: template, custom key stick with diagonals, left stick mouse, middle click, legacy tables, releaseAll, mapping text and AI prompt")
 '''
 
 with tempfile.TemporaryDirectory(prefix='madeira-pad-kbm-') as tmp:

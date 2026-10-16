@@ -810,7 +810,7 @@ final class MetalBackedView: UIView {
                 if !twoFingerMoved && now - twoFingerStartTime < 0.40
                     && !InputSettings.shared.relative {   // ml643: see touchesBegan
                     postPointer(F_RDOWN)
-                    Self.afterTapHold { [weak self] in guard let self else { return }; self.postPointer(self.F_RUP) }
+                    Self.afterTapHold { [self] in postPointer(F_RUP) }   // never skipped: a lost button-up stays held
                 }
                 twoFingerActive = false
             }
@@ -834,7 +834,7 @@ final class MetalBackedView: UIView {
         if !movedBeyondSlop && now - touchStartTime < 0.5 && !InputSettings.shared.relative {
             fputs("[trackpad] ended: click\n", stderr)
             postPointer(F_LDOWN)
-            Self.afterTapHold { [weak self] in guard let self else { return }; self.postPointer(self.F_LUP) }
+            Self.afterTapHold { [self] in postPointer(F_LUP) }   // never skipped: a lost button-up stays held
         }
     }
 

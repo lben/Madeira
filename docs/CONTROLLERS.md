@@ -170,6 +170,55 @@ While a stick is the mouse, the page also has its **Vertical speed**
 scale the camera's pitch and yaw differently from a mouse, and a stick cannot
 be compensated by hand the way a wrist does.
 
+### A mapping as text, and asking an AI for one
+
+The binds page's **Mapping as text** section (`PadMappingText` in
+`PadKeyboardMouse.swift`) has the table as plain text, so a mapping can be
+written by any AI chat, kept or shared:
+
+- **Copy prompt for an AI** copies a prompt with the game's name and Steam app
+  ID, what the player typed above it ("like the console edition", "like the most
+  popular Steam Deck layout", ...), how Madeira maps a controller, the answer
+  format and the game's mapping now. The AI is asked to look up the PC controls,
+  the console layout and the popular Steam Deck layouts first.
+- **Paste** replaces the table with the copied text. A whole answer can be
+  pasted: when it has a code block, only the block is read. Lines it cannot read
+  are listed and skipped; inputs it leaves out return to their defaults.
+- **Copy mapping** copies the mapping in effect.
+
+The format, one `input: action` per line, `#` starting a comment:
+
+```
+# Madeira controller mapping for Frostpunk
+mode: keyboard and mouse
+LS: mouse
+RS: keys
+RS up: Page Up
+RS right: E
+RS down: Page Down
+RS left: Q
+A: left click
+B: right click
+X: Space
+R3: middle click
+D-pad up: W
+Start: Escape
+vertical speed: 80%
+```
+
+Inputs: `LS`, `RS`, `LS up`/`right`/`down`/`left` (and `RS ...`), `A`, `B`,
+`X`, `Y`, `LB`, `RB`, `LT`, `RT`, `L3`, `R3`, `Start`, `Select`,
+`D-pad up`/`down`/`left`/`right`. A stick is `mouse`, `WASD`, `arrows`, `keys`
+or (LS) `nothing`; any other input is `left click`, `right click`,
+`middle click`, `show keyboard`, `nothing` or a key: `A`–`Z`, `0`–`9`,
+`F1`–`F12`, `Escape`, `Tab`, `Shift`, `Ctrl`, `Alt`, `Space`, `Enter`,
+`Backspace`, `Caps Lock`, `Up`, `Down`, `Left`, `Right`, `Insert`, `Delete`,
+`Home`, `End`, `Page Up`, `Page Down`, the symbol keys (`-`, `=`, `[`, `]`, `\`, `;`, `'`, `,`, `.`, `/` and the backquote), `Numpad 0`–`9`,
+`Numpad *`, `Numpad +`, `Numpad -`, `Numpad .`, `Numpad /`. Case, spaces and
+hyphens do not matter, and common spellings (`PgUp`, `Esc`, `Spacebar`,
+`Right stick up`, `L1`, `R2`) are read; text after the action in parentheses,
+after `//` or a dash is ignored. `mode:` and `game:` lines are informational.
+
 The Controller picker's second choice, **XInput and DirectInput**, is for games
 older than XInput: it exports `MADEIRA_DINPUT_PAD=1` for that launch only (the
 DirectInput device below), since a game reading both APIs may list two
