@@ -79,6 +79,12 @@ final class MadeiraDockModel: ObservableObject {
         if let plan { LogStore.shared.log("[dock-installers] " + plan) }
         watch = Task { @MainActor in
             var idle = 0, started = false, finishedNormally = false
+            // The host can end without a result (Valve's client going down its crash
+            // path); the desktop session then runs on, and this loop would wait forever.
+            // Its exits are counted from its first report field on: the one-time installs'
+            // `dockhost.exe --start-services` runs and ends before it.
+            let host = String(MadeiraDock.executable.split(separator: "\\").last ?? "").lowercased()
+            var hostExits: Int32?, hostGone = 0, hostEnded = false
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 let report = MadeiraDock.pollReport()
@@ -98,6 +104,17 @@ final class MadeiraDockModel: ObservableObject {
                         finishedNormally = true
                     }
                     break
+                }
+                if hostExits == nil, DockStartStatus.hostStarted(report.fields) { hostExits = madeira_process_exit_count(host) }
+                // A last report line may still be on its way: three polls (6 s).
+                if let base = hostExits, madeira_process_exit_count(host) > base {
+                    hostGone += 1
+                    if hostGone >= 3 {
+                        status = "Madeira Dock's host ended without reporting a result. Export the log."
+                        LogStore.shared.log("[madeira-dock] host exited without a result", level: .error)
+                        hostEnded = true
+                        break
+                    }
                 }
                 // Steam still counts another session of this account as playing
                 // (launch refusal 35); the host asks again for up to three minutes.
@@ -124,7 +141,7 @@ final class MadeiraDockModel: ObservableObject {
             // The game closed, but the Dock's desktop session never ends by itself: with
             // the Madeira Reopen shortcut on, a library session goes back to a fresh library.
             // Not while something still draws (a launcher's game outliving it).
-            if finishedNormally, LibraryModel.relaunchEnabled, LibraryModel.shared.current != nil {
+            if finishedNormally || hostEnded, LibraryModel.relaunchEnabled, LibraryModel.shared.current != nil {
                 let frames = (madeira_get_present_count(), winios_surface_present_count())
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
                 if !Task.isCancelled, frames == (madeira_get_present_count(), winios_surface_present_count()), LibraryModel.shared.current != nil {

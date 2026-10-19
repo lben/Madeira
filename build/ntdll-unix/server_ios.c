@@ -3603,9 +3603,12 @@ void process_exit_wrapper( int status )
     {
         extern void ios_jit_reclaim_process( void *peb );
         extern void ios_retire_own_fixed_base_image( void *peb );
+        extern void ios_child_note_exit( const UNICODE_STRING *image );
         void *dead_peb = ios_proc_sockets[i].peb;
+        PEB *peb = dead_peb;
         wine_log_write("[Wine ntdll/server] process_exit_wrapper(%d): closing child fd_socket=%d",
                        status, ios_proc_sockets[i].fd);
+        if (peb && peb->ProcessParameters) ios_child_note_exit( &peb->ProcessParameters->ImagePathName );
         /* ml987: hand back the fixed-base main image BEFORE the socket closes.
          * NtUnmapViewOfSection needs a live server connection, and this is the
          * last moment we have one while still on the owning process's thread. */

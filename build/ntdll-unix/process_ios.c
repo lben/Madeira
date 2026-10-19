@@ -453,20 +453,28 @@ static int ios_child_is_helper( const char *name )
     return 0;
 }
 
-static int ios_child_slot_take( const UNICODE_STRING *image )
+/* The image's file name, lowercase ASCII (the tables here key on it); returns its length. */
+static unsigned ios_image_name( const UNICODE_STRING *image, char name[64] )
 {
-    char name[64];
     unsigned i, n = 0, start = 0, len = image->Length / sizeof(WCHAR);
-    int slot = -1;
 
     for (i = 0; i < len; i++) if (image->Buffer[i] == '\\' || image->Buffer[i] == '/') start = i + 1;
-    for (i = start; i < len && n < sizeof(name) - 1; i++)
+    for (i = start; i < len && n < 63; i++)
     {
         WCHAR c = image->Buffer[i];
         name[n++] = (c >= 'A' && c <= 'Z') ? c + 32 : (c >= 32 && c < 127) ? c : '?';
     }
     if (!n) name[n++] = '?';
     name[n] = 0;
+    return n;
+}
+
+static int ios_child_slot_take( const UNICODE_STRING *image )
+{
+    char name[64];
+    unsigned i, n = ios_image_name( image, name );
+    int slot = -1;
+
     pthread_mutex_lock( &ios_child_lock );
     for (i = 0; i < IOS_CHILD_SLOTS; i++)
     {
@@ -509,6 +517,42 @@ int madeira_live_game_children( char *buf, int len, double max_age )
             used += snprintf( buf + used, len - used, "%s%s", used ? " " : "", ios_child_slots[i].name );
         if (used >= len) used = len - 1;
     }
+    pthread_mutex_unlock( &ios_child_lock );
+    return count;
+}
+
+/* How many times a child pseudo-process of each image name has ended. A process
+ * that ends from a worker thread never returns to its boot thread, so its slot
+ * above stays taken (and its boot thread may never run again); process_exit_wrapper
+ * (server_ios.c), which every exit reaches on whichever thread, counts it here.
+ * Madeira Dock reads the count of its host, which can end without reporting. */
+static struct { char name[64]; unsigned count; } ios_child_exits[IOS_CHILD_SLOTS];
+
+void ios_child_note_exit( const UNICODE_STRING *image )
+{
+    char name[64];
+    unsigned i;
+
+    ios_image_name( image, name );
+    pthread_mutex_lock( &ios_child_lock );
+    for (i = 0; i < IOS_CHILD_SLOTS; i++)
+    {
+        if (ios_child_exits[i].count && strcmp( ios_child_exits[i].name, name )) continue;
+        if (!ios_child_exits[i].count) strcpy( ios_child_exits[i].name, name );
+        ios_child_exits[i].count++;
+        break;
+    }
+    pthread_mutex_unlock( &ios_child_lock );
+}
+
+/* Called by the app (WineProcessBridge.h): `name` is a lowercase file name. */
+int madeira_process_exit_count( const char *name )
+{
+    unsigned i, count = 0;
+
+    pthread_mutex_lock( &ios_child_lock );
+    for (i = 0; i < IOS_CHILD_SLOTS && ios_child_exits[i].count; i++)
+        if (!strcmp( ios_child_exits[i].name, name )) count = ios_child_exits[i].count;
     pthread_mutex_unlock( &ios_child_lock );
     return count;
 }

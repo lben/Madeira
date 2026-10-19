@@ -298,7 +298,9 @@ Shortcut Input. Madeira runs it and quits. A second Play passes the game's
 `madeira://play` link, the same one as its Home Screen shortcut, so the game
 starts once the library is up. When a Madeira Dock game closes normally and
 nothing draws for 3 s, the Dock's desktop session (which does not end by
-itself) is left the same way, and the shortcut opens a fresh library. If
+itself) is left the same way, and the shortcut opens a fresh library. So is a
+session whose host (`dockhost.exe`) ended without writing its result: 6 s after
+its process ends, the log says `[madeira-dock] host exited without a result`. If
 Shortcuts does not open, the restart notice shows as before.
 
 ## Screen layouts

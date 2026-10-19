@@ -24,6 +24,11 @@ int wine_crash_exit_status(uint32_t *status);
 // Forget the recorded status; called when a session begins.
 void wine_exit_status_reset(void);
 
+// How many times a child process with this image file name (lowercase, e.g.
+// "dockhost.exe") has ended in this app run, on whichever of its threads it ended
+// (process_ios.c).
+int madeira_process_exit_count(const char *name);
+
 // Steam S0 net-test VPN gate: write C:\madeira-continue.flag into the
 // prefix's drive_c so the paused winhttp-test.exe resumes to the Steam
 // stage. Called by the "Continue Net Test" UI button after the user has
