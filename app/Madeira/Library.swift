@@ -5737,11 +5737,25 @@ struct ScreenLayoutEditor: View {
             guard mine == attempt else { return }
             if let frame {
                 image = frame; luma = ScreenLayouts.luma(of: frame)
+                Self.save(frame)
                 // The screen the game shows now, when one is recognised.
                 if sel == nil, let s = screens.indices.first(where: { screens[$0].anchored && onFrame(screens[$0]) }) { sel = .screen(s) }
             } else { failed = true }
         }
         // A game that presents no frame (paused on a static screen) leaves the request open.
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { if mine == attempt && image == nil { failed = true } }
+    }
+
+    /// The frame as the game drew it (before any zone), at its own resolution, in
+    /// Documents/capture (Files): to look at or share what a zone has to work from.
+    private static func save(_ frame: CGImage) {
+        DispatchQueue.global(qos: .utility).async {
+            let folder = LibraryModel.documents.appendingPathComponent("capture", isDirectory: true)
+            let url = folder.appendingPathComponent("screen-layout-frame.png")
+            guard let data = UIImage(cgImage: frame).pngData(),
+                  (try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)) != nil,
+                  (try? data.write(to: url, options: .atomic)) != nil else { return }
+            LogStore.shared.log("[screen-layout] frame saved to Documents/capture/screen-layout-frame.png (\(frame.width)x\(frame.height))")
+        }
     }
 }

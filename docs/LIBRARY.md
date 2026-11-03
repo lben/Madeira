@@ -341,6 +341,9 @@ the zones' **parts**.
   opening. The tree and the bar fold away; the folded bar's button can be
   dragged.
 
+Each time the editor reads the game's frame it also saves it, as the game drew it
+and at its own resolution, to `Documents/capture/screen-layout-frame.png` (Files).
+
 **Save** stores the screens with the game (`layoutScreens` in the library file;
 layouts of earlier builds are read with a screen for each anchor, zones without
 one in Always) and they apply at once and in its next sessions; the menu's
