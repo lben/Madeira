@@ -5282,11 +5282,18 @@ struct ScreenLayoutEditor: View {
                 }
             } label: { Label("Move to", systemImage: "arrow.right.square") }
                 .disabled(screens.count < 2)
-            if z < screens[s].zones.count - 1 {
-                Button("To front", systemImage: "square.3.layers.3d.top.filled") {
-                    guard ok() else { return }
-                    record(); screens[s].zones.append(screens[s].zones.remove(at: z)); sel = .zone(s, screens[s].zones.count - 1)
-                }
+            // The screen's zones are drawn in the tree's order, later ones on top.
+            if screens[s].zones.count > 1 {
+                Menu {
+                    Button("To front", systemImage: "square.3.layers.3d.top.filled") {
+                        guard ok() else { return }
+                        record(); screens[s].zones.append(screens[s].zones.remove(at: z)); sel = .zone(s, screens[s].zones.count - 1)
+                    }.disabled(z == screens[s].zones.count - 1)
+                    Button("To back", systemImage: "square.3.layers.3d.bottom.filled") {
+                        guard ok() else { return }
+                        record(); screens[s].zones.insert(screens[s].zones.remove(at: z), at: 0); sel = .zone(s, 0)
+                    }.disabled(z == 0)
+                } label: { Label("Order", systemImage: "square.3.layers.3d") }
             }
             Button("Delete zone", systemImage: "trash", role: .destructive) {
                 guard ok() else { return }
