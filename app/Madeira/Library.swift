@@ -4846,6 +4846,15 @@ enum ScreenLayouts {
     }
 }
 
+/// A zone row in the screen layout editor's tree while another zone row is dragged over it.
+private struct ZoneRowDrop: DropDelegate {
+    let over: () -> Void
+    let done: () -> Void
+    func dropEntered(info: DropInfo) { over() }
+    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+    func performDrop(info: DropInfo) -> Bool { done(); return true }
+}
+
 /// In-game menu › Screen layout: the game's frame, frozen, with the game's screens in a
 /// tree on the left (screen › zone › part) and the chosen item's controls in the bar.
 /// New screen, then a drag over its anchor (something always on that screen and only
@@ -4889,6 +4898,10 @@ struct ScreenLayoutEditor: View {
     /// Zones hidden in the editor (the eye on their row), so what lies under them can be
     /// marked. Kept by value: choosing or changing a zone shows it again. Not saved.
     @State private var hidden: [LayoutZone] = []
+    /// The zone row being dragged in the tree (screen, index), and whether that drag
+    /// has recorded its undo step yet.
+    @State private var rowDrag: (s: Int, z: Int)?
+    @State private var rowDragRecorded = false
     private enum Mode { case none, newScreen, anchor, zone, part, text }
     private enum Selection: Equatable { case screen(Int), zone(Int, Int), part(Int, Int, Int) }
     private static let scales: ClosedRange<Double> = 0.5...6
@@ -5073,6 +5086,12 @@ struct ScreenLayoutEditor: View {
                 .labelStyle(.iconOnly).buttonStyle(.plain).foregroundStyle(off ? Color.secondary : Color.primary)
                 .frame(width: 26, height: 26).contentShape(Rectangle())
             }
+            // Press and drag a zone's row to another place among its screen's zones.
+            .onDrag {
+                rowDrag = (si, zi); rowDragRecorded = false
+                return NSItemProvider(object: name(zone: zi, in: si) as NSString)
+            }
+            .onDrop(of: [.text], delegate: ZoneRowDrop(over: { dragRow(to: si, zi) }, done: { rowDrag = nil }))
             if chosenZone(si, zi), zone.parts.count > 1 {
                 ForEach(zone.parts.indices, id: \.self) { pi in
                     row(icon: "square.dashed", title: "Part \(pi + 1)", indent: 2, chosen: sel == .part(si, zi, pi), dim: !here,
@@ -5101,6 +5120,22 @@ struct ScreenLayoutEditor: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+
+    /// The dragged row's zone takes zone `z`'s place in screen `s` (the tree's order is the
+    /// drawing order); the chosen zone or part keeps its selection. One undo step per drag.
+    private func dragRow(to s: Int, _ z: Int) {
+        guard let d = rowDrag, d.s == s, d.z != z, screens.indices.contains(s),
+              screens[s].zones.indices.contains(d.z), screens[s].zones.indices.contains(z) else { return }
+        if !rowDragRecorded { record(); rowDragRecorded = true }
+        screens[s].zones.insert(screens[s].zones.remove(at: d.z), at: z)
+        let moved = { (i: Int) in i == d.z ? z : d.z < i && i <= z ? i - 1 : z <= i && i < d.z ? i + 1 : i }
+        switch sel {
+        case .zone(let t, let i)? where t == s: sel = .zone(s, moved(i))
+        case .part(let t, let i, let p)? where t == s: sel = .part(s, moved(i), p)
+        default: break
+        }
+        rowDrag = (s, z)
     }
 
     /// Add zone, Find text: into the chosen screen, else the first one this frame shows, else Always.
